@@ -1,6 +1,6 @@
 # pulse-client — Rust SDK for StreamFlow Pulse
 
-Official Rust client for [Pulse](https://github.com/olsisoft/streamflow) — the AI Agent Platform. Async-first, **`reqwest` + `serde`** stack, **MSRV 1.82**.
+Official Rust client for [Pulse](https://github.com/olsisoft/pulse-rs) — the AI Agent Platform. Async-first, **`reqwest` + `serde`** stack, **MSRV 1.82**.
 
 ```rust
 use pulse_client::PulseClient;
@@ -174,8 +174,8 @@ let client = PulseClient::builder()
 ## Development
 
 ```bash
-git clone https://github.com/olsisoft/streamflow.git
-cd streamflow/pulse-rs
+git clone https://github.com/olsisoft/pulse-rs.git
+cd pulse-rs
 
 cargo build
 cargo test
