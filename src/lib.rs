@@ -1,4 +1,4 @@
-//! Official Rust client for [StreamFlow Pulse](https://github.com/olsisoft/streamflow)
+//! Official Rust client for [StreamFlow Pulse](https://github.com/olsisoft/pulse-rs)
 //! — the AI Agent Platform.
 //!
 //! # Quick start
