@@ -282,6 +282,60 @@ pub struct CdcJoinOptions {
     pub state_backend: Option<String>,
 }
 
+/// B-109 — options for [`StreamBuilder::map_llm`]. `output_field` is required.
+#[derive(Debug, Clone, Default)]
+pub struct MapLlmOptions {
+    pub output_field: String,
+    pub model: Option<String>,
+    pub temperature: Option<f64>,
+    pub max_tokens: Option<u32>,
+    pub parallelism: Option<u32>,
+    /// Must be `"PRESERVE_INPUT"` or `"UNORDERED"`.
+    pub ordering: Option<String>,
+    /// Must be `"EMIT_ERROR"`, `"DROP"`, or `"PASS_THROUGH"`.
+    pub on_failure: Option<String>,
+    pub max_calls_per_sec: Option<u32>,
+}
+
+/// B-109 — options for [`StreamBuilder::extract`]. `instruction` + `schema` required.
+#[derive(Debug, Clone, Default)]
+pub struct ExtractOptions {
+    pub instruction: String,
+    pub schema: BTreeMap<String, String>,
+    pub model: Option<String>,
+    pub temperature: Option<f64>,
+    pub max_tokens: Option<u32>,
+    pub on_failure: Option<String>,
+}
+
+/// B-109 Phase 2 — options for [`StreamBuilder::mcp_call`].
+#[derive(Debug, Clone, Default)]
+pub struct McpCallOptions {
+    pub args: Option<BTreeMap<String, Value>>,
+    pub output_field: Option<String>,
+    pub parallelism: Option<u32>,
+    pub ordering: Option<String>,
+    pub on_failure: Option<String>,
+}
+
+/// B-112 — options for [`StreamBuilder::ml_predict`]. `model`, `input_fields`
+/// and `output_field` are required.
+#[derive(Debug, Clone, Default)]
+pub struct MlPredictOptions {
+    /// Registered model name (upload first via `client.models().upload(...)`).
+    pub model: String,
+    /// Feature names pulled from the event, in the model's input order.
+    /// Dotted paths (`customer.tier`) resolve through nested objects.
+    pub input_fields: Vec<String>,
+    /// Event field the prediction object is written to.
+    pub output_field: String,
+    pub parallelism: Option<u32>,
+    /// Must be `"PRESERVE_INPUT"` or `"UNORDERED"`.
+    pub ordering: Option<String>,
+    /// Must be `"EMIT_ERROR"`, `"DROP"`, or `"PASS_THROUGH"`.
+    pub on_failure: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // StreamBuilder
 // ---------------------------------------------------------------------------
@@ -574,6 +628,168 @@ impl StreamBuilder {
         self
     }
 
+    /// B-109 — enrich each event with an LLM completion. `prompt` supports
+    /// `{field}` placeholders (and `{__payload__}`) substituted from the event
+    /// server-side; the completion lands on the event under `output_field`.
+    pub fn map_llm(mut self, prompt: impl Into<String>, options: MapLlmOptions) -> Self {
+        let prompt = prompt.into();
+        require_nonblank("prompt", &prompt);
+        require_nonblank("output_field", &options.output_field);
+        if let Some(ref o) = options.ordering {
+            if o != "PRESERVE_INPUT" && o != "UNORDERED" {
+                panic!("ordering must be PRESERVE_INPUT or UNORDERED, got {o:?}");
+            }
+        }
+        check_failure(&options.on_failure);
+        let mut op = Map::new();
+        op.insert("type".into(), Value::String("mapLlm".into()));
+        op.insert("prompt".into(), Value::String(prompt));
+        op.insert("outputField".into(), Value::String(options.output_field));
+        if let Some(m) = options.model {
+            op.insert("model".into(), Value::String(m));
+        }
+        if let Some(t) = options.temperature {
+            op.insert("temperature".into(), json!(t));
+        }
+        if let Some(n) = options.max_tokens {
+            op.insert("maxTokens".into(), Value::Number(n.into()));
+        }
+        if let Some(n) = options.parallelism {
+            op.insert("parallelism".into(), Value::Number(n.into()));
+        }
+        if let Some(o) = options.ordering {
+            op.insert("ordering".into(), Value::String(o));
+        }
+        if let Some(f) = options.on_failure {
+            op.insert("onFailure".into(), Value::String(f));
+        }
+        if let Some(n) = options.max_calls_per_sec {
+            op.insert("maxCallsPerSec".into(), Value::Number(n.into()));
+        }
+        self.operators.push(op);
+        self
+    }
+
+    /// B-109 — LLM → typed structured fields merged into the event. The LLM is
+    /// asked for a JSON object keyed by `options.schema`'s fields; missing /
+    /// malformed fields become null server-side.
+    pub fn extract(mut self, options: ExtractOptions) -> Self {
+        require_nonblank("instruction", &options.instruction);
+        if options.schema.is_empty() {
+            panic!("extract operator requires a non-empty schema");
+        }
+        check_failure(&options.on_failure);
+        let mut schema = Map::new();
+        for (k, v) in options.schema {
+            schema.insert(k, Value::String(v));
+        }
+        let mut op = Map::new();
+        op.insert("type".into(), Value::String("extract".into()));
+        op.insert("instruction".into(), Value::String(options.instruction));
+        op.insert("schema".into(), Value::Object(schema));
+        if let Some(m) = options.model {
+            op.insert("model".into(), Value::String(m));
+        }
+        if let Some(t) = options.temperature {
+            op.insert("temperature".into(), json!(t));
+        }
+        if let Some(n) = options.max_tokens {
+            op.insert("maxTokens".into(), Value::Number(n.into()));
+        }
+        if let Some(f) = options.on_failure {
+            op.insert("onFailure".into(), Value::String(f));
+        }
+        self.operators.push(op);
+        self
+    }
+
+    /// B-109 Phase 2 — invoke an MCP tool per event. `options.args` string
+    /// values support `{field}` substitution. On success the tool output is
+    /// written to `options.output_field` (omit for a fire-and-forget effect).
+    pub fn mcp_call(mut self, tool: impl Into<String>, options: McpCallOptions) -> Self {
+        let tool = tool.into();
+        require_nonblank("tool", &tool);
+        if let Some(ref o) = options.ordering {
+            if o != "PRESERVE_INPUT" && o != "UNORDERED" {
+                panic!("ordering must be PRESERVE_INPUT or UNORDERED, got {o:?}");
+            }
+        }
+        check_failure(&options.on_failure);
+        let mut op = Map::new();
+        op.insert("type".into(), Value::String("mcpCall".into()));
+        op.insert("tool".into(), Value::String(tool));
+        if let Some(args) = options.args {
+            let mut m = Map::new();
+            for (k, v) in args {
+                m.insert(k, v);
+            }
+            op.insert("args".into(), Value::Object(m));
+        }
+        if let Some(f) = options.output_field {
+            op.insert("outputField".into(), Value::String(f));
+        }
+        if let Some(n) = options.parallelism {
+            op.insert("parallelism".into(), Value::Number(n.into()));
+        }
+        if let Some(o) = options.ordering {
+            op.insert("ordering".into(), Value::String(o));
+        }
+        if let Some(f) = options.on_failure {
+            op.insert("onFailure".into(), Value::String(f));
+        }
+        self.operators.push(op);
+        self
+    }
+
+    /// B-112 — score each event with an embedded ML model. The uploaded ONNX
+    /// model runs in-process on the Pulse engine (no model-server hop): the
+    /// named `options.input_fields` are pulled from the event payload, fed to
+    /// the model, and the model's output is written as a nested object under
+    /// `options.output_field` (so downstream operators can branch on it, e.g.
+    /// `.filter("prediction.fraud_score > 0.8")`).
+    ///
+    /// Upload the model first with [`ModelsResource::upload`](crate::ModelsResource::upload).
+    pub fn ml_predict(mut self, options: MlPredictOptions) -> Self {
+        require_nonblank("model", &options.model);
+        require_nonblank("output_field", &options.output_field);
+        if options.input_fields.is_empty()
+            || options.input_fields.iter().any(|f| f.trim().is_empty())
+        {
+            panic!("input_fields must be a non-empty list of non-blank strings");
+        }
+        if let Some(ref o) = options.ordering {
+            if o != "PRESERVE_INPUT" && o != "UNORDERED" {
+                panic!("ordering must be PRESERVE_INPUT or UNORDERED, got {o:?}");
+            }
+        }
+        check_failure(&options.on_failure);
+        let mut op = Map::new();
+        op.insert("type".into(), Value::String("mlPredict".into()));
+        op.insert("model".into(), Value::String(options.model));
+        op.insert(
+            "inputFields".into(),
+            Value::Array(
+                options
+                    .input_fields
+                    .into_iter()
+                    .map(Value::String)
+                    .collect(),
+            ),
+        );
+        op.insert("outputField".into(), Value::String(options.output_field));
+        if let Some(n) = options.parallelism {
+            op.insert("parallelism".into(), Value::Number(n.into()));
+        }
+        if let Some(o) = options.ordering {
+            op.insert("ordering".into(), Value::String(o));
+        }
+        if let Some(f) = options.on_failure {
+            op.insert("onFailure".into(), Value::String(f));
+        }
+        self.operators.push(op);
+        self
+    }
+
     /// Broadcast join: enrich the stream against a fully-replicated table.
     pub fn broadcast_join(mut self, options: BroadcastJoinOptions) -> Self {
         require_nonblank("join_key_field", &options.join_key_field);
@@ -649,6 +865,20 @@ impl StreamBuilder {
         self.output_topic = Some(topic);
         self.sink_channel = Some(channel);
         self
+    }
+
+    /// Terminate the stream in a connector sink (Segment, Kafka, Postgres, …) —
+    /// an ergonomic, connector-first alias for
+    /// [`to_topic_with_channel`](Self::to_topic_with_channel) using an
+    /// intermediate `<connector_type>-sink-out` topic. Chain
+    /// [`with_sink_config`](Self::with_sink_config) for the connector config.
+    /// `connector_type` is a subType from `client.connectors()`; bridged
+    /// connectors require the enterprise bridge JAR on the server.
+    pub fn to_connector(self, connector_type: impl Into<String>) -> Self {
+        let ct = connector_type.into();
+        require_nonblank("connector_type", &ct);
+        let topic = format!("{ct}-sink-out");
+        self.to_topic_with_channel(topic, ct)
     }
 
     /// Merges extra config into the sink node's `config` map.
@@ -878,5 +1108,14 @@ impl std::fmt::Debug for StreamsResource<'_> {
 fn require_nonblank(name: &str, value: &str) {
     if value.trim().is_empty() {
         panic!("{name} must be a non-empty string");
+    }
+}
+
+/// Panics if `on_failure` is set to an invalid value (B-109).
+fn check_failure(on_failure: &Option<String>) {
+    if let Some(f) = on_failure {
+        if f != "EMIT_ERROR" && f != "DROP" && f != "PASS_THROUGH" {
+            panic!("on_failure must be EMIT_ERROR, DROP, or PASS_THROUGH, got {f:?}");
+        }
     }
 }
