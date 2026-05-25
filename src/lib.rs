@@ -1,4 +1,4 @@
-//! Official Rust client for [StreamFlow Pulse](https://github.com/olsisoft/streamflow)
+//! Official Rust client for [StreamFlow Pulse](https://github.com/olsisoft/pulse-rs)
 //! — the AI Agent Platform.
 //!
 //! # Quick start
@@ -43,11 +43,12 @@
 //! (`streamflow-pulse/src/main/resources/openapi/openapi.yaml`). Drift caught
 //! at PR time by the in-tree spec invariant tests (B-103).
 
-#![doc(html_root_url = "https://docs.rs/pulse-client/2.6.0")]
+#![doc(html_root_url = "https://docs.rs/pulse-client/2.6.1")]
 #![warn(missing_debug_implementations)]
 #![warn(rust_2018_idioms)]
 
 mod client;
+mod duplex;
 mod error;
 mod events;
 mod iq;
@@ -55,15 +56,18 @@ mod resources;
 mod streams;
 
 pub use client::{PulseClient, PulseClientBuilder};
+pub use duplex::{derive_ws_url, DuplexChannel, DuplexOutput};
 pub use error::PulseError;
 pub use events::{EventsResource, EventsStream};
 pub use iq::{iq_and, iq_leaf, iq_not, iq_or, IQQueryOptions, IQResource, IQScanOptions};
 pub use resources::{
-    AgentsResource, AuthResource, PipelinesResource, TemplatesResource, UsersResource,
+    AgentsResource, AuthResource, ConnectorsResource, ModelUpload, ModelsResource,
+    PipelinesResource, TemplatesResource, UsersResource,
 };
 pub use streams::{
     aggs, windows, BranchSpec, BroadcastJoinOptions, CdcJoinOptions, CepOptions,
-    EnrichAsyncOptions, MapOptions, StreamBuilder, StreamsResource, WindowOptions, WindowSpec,
+    EnrichAsyncOptions, ExtractOptions, MapLlmOptions, MapOptions, McpCallOptions,
+    MlPredictOptions, StreamBuilder, StreamsResource, WindowOptions, WindowSpec,
 };
 
 // Re-export serde_json::Value so callers don't need to add serde_json to
@@ -71,7 +75,7 @@ pub use streams::{
 pub use serde_json::Value;
 
 /// Current SDK version (matches `Cargo.toml` and the Pulse server it targets).
-pub const VERSION: &str = "2.6.0";
+pub const VERSION: &str = "2.6.1";
 
 impl std::fmt::Debug for PulseClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -109,5 +113,17 @@ impl<'c> std::fmt::Debug for TemplatesResource<'c> {
 impl<'c> std::fmt::Debug for UsersResource<'c> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UsersResource").finish()
+    }
+}
+
+impl<'c> std::fmt::Debug for ConnectorsResource<'c> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectorsResource").finish()
+    }
+}
+
+impl<'c> std::fmt::Debug for ModelsResource<'c> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelsResource").finish()
     }
 }
