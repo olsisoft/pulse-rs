@@ -202,10 +202,90 @@ impl<'c> IQResource<'c> {
     /// `error == "Key not found"` vs `error == "Agent has no queryable
     /// state"` (with `reason` field) — to distinguish.
     pub async fn get(self, agent_id: &str, key: &str) -> Result<Value, PulseError> {
-        let path = format!(
+        self.get_as_of_inner(agent_id, key, None).await
+    }
+
+    /// `GET /api/pulse/iq/agents/{id}/state/value/{key}?as_of=<spec>` —
+    /// B-113 time-travel point lookup.
+    ///
+    /// Reads the value as it was at a past instant instead of the live value.
+    /// `as_of` accepts `now`, a relative offset (`-1h`, `-30m`, `-7d`), an
+    /// ISO-8601 instant, or epoch millis — passed through to the server
+    /// verbatim. The response then also carries `asOf` (resolved epoch ms)
+    /// alongside the usual `agentId`, `key`, `value`:
+    ///
+    /// ```no_run
+    /// # use pulse_client::PulseClient;
+    /// # async fn run(client: &PulseClient) -> Result<(), pulse_client::PulseError> {
+    /// let state = client.iq().get_as_of("user-sessions", "u42", "-1h").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    /// Same as [`get`](Self::get) — [`PulseError::NotFound`] when the key is
+    /// absent (at that instant) OR the agent is not queryable.
+    pub async fn get_as_of(
+        self,
+        agent_id: &str,
+        key: &str,
+        as_of: &str,
+    ) -> Result<Value, PulseError> {
+        self.get_as_of_inner(agent_id, key, Some(as_of)).await
+    }
+
+    async fn get_as_of_inner(
+        self,
+        agent_id: &str,
+        key: &str,
+        as_of: Option<&str>,
+    ) -> Result<Value, PulseError> {
+        let mut path = format!(
             "/api/pulse/iq/agents/{}/state/value/{}",
             encode_segment(agent_id),
             encode_segment(key),
+        );
+        if let Some(spec) = as_of {
+            path.push_str("?as_of=");
+            path.push_str(&encode_segment(spec));
+        }
+        self.client
+            .request(Method::GET, &path, None::<&()>, true)
+            .await
+    }
+
+    /// `GET /api/pulse/iq/agents/{id}/state/diff/{key}?from=&to=` — B-113
+    /// field-level state diff.
+    ///
+    /// Returns the delta of `key`'s state between two instants. `from` and
+    /// `to` accept the same specs as [`get_as_of`](Self::get_as_of); they
+    /// default server-side to `-1h` / `now` when blank, but this method
+    /// always sends them explicitly. The response carries
+    /// `{agentId, key, fromTs, toTs, changes}` where `changes` maps each
+    /// changed field to `{delta?, from, to}` (`delta` present for numeric
+    /// fields), or `{added}` / `{removed}`:
+    ///
+    /// ```no_run
+    /// # use pulse_client::PulseClient;
+    /// # async fn run(client: &PulseClient) -> Result<(), pulse_client::PulseError> {
+    /// let d = client.iq().diff("user-sessions", "u42", "-1h", "now").await?;
+    /// let delta = d["changes"]["cart_value"]["delta"].as_f64();
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn diff(
+        self,
+        agent_id: &str,
+        key: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<Value, PulseError> {
+        let path = format!(
+            "/api/pulse/iq/agents/{}/state/diff/{}?from={}&to={}",
+            encode_segment(agent_id),
+            encode_segment(key),
+            encode_segment(from),
+            encode_segment(to),
         );
         self.client
             .request(Method::GET, &path, None::<&()>, true)
