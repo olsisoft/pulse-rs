@@ -42,6 +42,9 @@ pub enum PulseError {
     NoToken { path: String },
     /// The supplied configuration is invalid (e.g. empty `base_url`).
     InvalidConfig(String),
+    /// B-114 — a duplex WebSocket channel failed (handshake, framing, or the
+    /// connection dropped). Carries a human-readable description of the cause.
+    Duplex(String),
 }
 
 impl PulseError {
@@ -70,7 +73,10 @@ impl PulseError {
             PulseError::Validation { .. } => Some(400),
             PulseError::RateLimit { .. } => Some(429),
             PulseError::Api { status, .. } => Some(*status),
-            PulseError::Transport(_) | PulseError::Json(_) | PulseError::InvalidConfig(_) => None,
+            PulseError::Transport(_)
+            | PulseError::Json(_)
+            | PulseError::InvalidConfig(_)
+            | PulseError::Duplex(_) => None,
         }
     }
 
@@ -117,6 +123,7 @@ impl fmt::Display for PulseError {
                 );
             }
             PulseError::InvalidConfig(msg) => return write!(f, "pulse: invalid config — {msg}"),
+            PulseError::Duplex(msg) => return write!(f, "pulse: duplex channel failure — {msg}"),
         };
         write!(f, "{summary}")
     }

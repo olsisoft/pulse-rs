@@ -203,6 +203,198 @@ impl TemplatesResource<'_> {
 }
 
 // ---------------------------------------------------------------------------
+// ModelsResource — client.models()
+// ---------------------------------------------------------------------------
+
+/// `client.models()` — B-112 embedded ML model registry.
+///
+/// Upload ONNX models that the streaming `ml_predict` operator scores events
+/// against, in-process on the Pulse engine (no model-server hop). Models are
+/// org-scoped; upload / delete require the ADMIN role.
+///
+/// # Example
+///
+/// ```no_run
+/// use pulse_client::{PulseClient, ModelUpload};
+/// use std::collections::BTreeMap;
+///
+/// # async fn run(client: &PulseClient) -> Result<(), pulse_client::PulseError> {
+/// let mut input = BTreeMap::new();
+/// input.insert("amount".to_string(), "float".to_string());
+/// input.insert("country".to_string(), "string".to_string());
+///
+/// client
+///     .models()
+///     .upload(
+///         ModelUpload::from_path("fraud-classifier", "./model.onnx")
+///             .input_schema(input),
+///     )
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
+pub struct ModelsResource<'c> {
+    pub(crate) client: &'c PulseClient,
+}
+
+/// B-112 — describes a model upload to [`ModelsResource::upload`].
+///
+/// Supply the model bytes either by file `path` (read at upload time) or as
+/// raw `data`. Exactly one of the two must be set — [`ModelsResource::upload`]
+/// returns a [`PulseError::InvalidConfig`] otherwise.
+#[derive(Debug, Clone, Default)]
+pub struct ModelUpload {
+    /// Model name referenced by `ml_predict(model = ...)`.
+    pub name: String,
+    /// Filesystem path to the `.onnx` file. Mutually exclusive with `data`.
+    pub path: Option<String>,
+    /// Raw model bytes. Mutually exclusive with `path`.
+    pub data: Option<Vec<u8>>,
+    /// Model runtime — only `"onnx"` is supported today. Defaults to `"onnx"`.
+    pub runtime: Option<String>,
+    /// Ordered feature-name → type map, used to pack features into the input
+    /// tensor (in the model's input order).
+    pub input_schema: Option<std::collections::BTreeMap<String, String>>,
+    /// Output-name → type map (informational).
+    pub output_schema: Option<std::collections::BTreeMap<String, String>>,
+}
+
+impl ModelUpload {
+    /// Upload from a filesystem path to the `.onnx` file.
+    pub fn from_path(name: impl Into<String>, path: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            path: Some(path.into()),
+            ..Self::default()
+        }
+    }
+
+    /// Upload from raw model bytes.
+    pub fn from_bytes(name: impl Into<String>, data: Vec<u8>) -> Self {
+        Self {
+            name: name.into(),
+            data: Some(data),
+            ..Self::default()
+        }
+    }
+
+    /// Override the runtime (default `"onnx"`).
+    pub fn runtime(mut self, runtime: impl Into<String>) -> Self {
+        self.runtime = Some(runtime.into());
+        self
+    }
+
+    /// Set the ordered input feature schema.
+    pub fn input_schema(mut self, schema: std::collections::BTreeMap<String, String>) -> Self {
+        self.input_schema = Some(schema);
+        self
+    }
+
+    /// Set the (informational) output schema.
+    pub fn output_schema(mut self, schema: std::collections::BTreeMap<String, String>) -> Self {
+        self.output_schema = Some(schema);
+        self
+    }
+}
+
+impl ModelsResource<'_> {
+    /// `POST /api/pulse/ml-models` — upload (or replace) a model.
+    ///
+    /// Sent as `multipart/form-data`: a file part named `model` carrying the
+    /// bytes, plus text parts `name`, `runtime`, and (when set) `inputSchema` /
+    /// `outputSchema` as JSON strings. Replacing an existing name hot-swaps the
+    /// model with no agent restart.
+    ///
+    /// Returns the persisted model metadata (name, runtime, sha256, version, …).
+    ///
+    /// # Errors
+    ///
+    /// - [`PulseError::InvalidConfig`] if `name` is blank, if neither or both
+    ///   of `path`/`data` are set, or if the model bytes are empty.
+    /// - [`PulseError::Transport`] if reading the file at `path` fails.
+    pub async fn upload(&self, upload: ModelUpload) -> Result<Value, PulseError> {
+        if upload.name.trim().is_empty() {
+            return Err(PulseError::InvalidConfig(
+                "model name must be a non-empty string".to_string(),
+            ));
+        }
+        if upload.path.is_some() == upload.data.is_some() {
+            return Err(PulseError::InvalidConfig(
+                "provide exactly one of 'path' or 'data'".to_string(),
+            ));
+        }
+
+        let (blob, filename) = match (&upload.path, upload.data) {
+            (Some(path), None) => {
+                let bytes = std::fs::read(path)
+                    .map_err(|e| PulseError::InvalidConfig(format!("read {path}: {e}")))?;
+                let filename = path
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("model.onnx")
+                    .to_string();
+                (bytes, filename)
+            }
+            (None, Some(data)) => (data, format!("{}.onnx", upload.name)),
+            // Unreachable — guarded by the XOR check above.
+            _ => unreachable!("exactly one of path/data enforced above"),
+        };
+        if blob.is_empty() {
+            return Err(PulseError::InvalidConfig(
+                "model bytes are empty".to_string(),
+            ));
+        }
+
+        let runtime = upload.runtime.unwrap_or_else(|| "onnx".to_string());
+        let model_part = reqwest::multipart::Part::bytes(blob)
+            .file_name(filename)
+            .mime_str("application/octet-stream")
+            .map_err(PulseError::Transport)?;
+        let mut form = reqwest::multipart::Form::new()
+            .text("name", upload.name)
+            .text("runtime", runtime)
+            .part("model", model_part);
+        if let Some(schema) = upload.input_schema {
+            form = form.text("inputSchema", serde_json::to_string(&schema)?);
+        }
+        if let Some(schema) = upload.output_schema {
+            form = form.text("outputSchema", serde_json::to_string(&schema)?);
+        }
+
+        self.client
+            .request_multipart("/api/pulse/ml-models", form)
+            .await
+    }
+
+    /// `GET /api/pulse/ml-models` — models registered for the caller's org.
+    pub async fn list(&self) -> Result<Vec<Value>, PulseError> {
+        let result = self
+            .client
+            .request(Method::GET, "/api/pulse/ml-models", None::<&()>, true)
+            .await?;
+        Ok(unwrap_list(&result, "models"))
+    }
+
+    /// `GET /api/pulse/ml-models/{name}` — metadata for one model.
+    pub async fn get(&self, name: &str) -> Result<Value, PulseError> {
+        let path = format!("/api/pulse/ml-models/{}", encode_path(name));
+        self.client
+            .request(Method::GET, &path, None::<&()>, true)
+            .await
+    }
+
+    /// `DELETE /api/pulse/ml-models/{name}` — remove a model (ADMIN).
+    pub async fn delete(&self, name: &str) -> Result<(), PulseError> {
+        let path = format!("/api/pulse/ml-models/{}", encode_path(name));
+        self.client
+            .request::<()>(Method::DELETE, &path, None, true)
+            .await?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // UsersResource — client.users()
 // ---------------------------------------------------------------------------
 
@@ -253,4 +445,37 @@ fn encode_path(segment: &str) -> String {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// ConnectorsResource — client.connectors() (B-093 follow-up: catalogue parity)
+// ---------------------------------------------------------------------------
+
+/// `client.connectors()` — the connector catalogue, the same list the Pipeline
+/// Studio palette and `pulse connectors list` show. Each entry is
+/// `{subType, displayName, configFields}`; use the `subType` as a sink/source
+/// node `type` in a pipeline definition deployed via `client.pipelines()`.
+/// Bridged connectors appear only when the enterprise bridge JAR is on the
+/// server's classpath.
+pub struct ConnectorsResource<'c> {
+    pub(crate) client: &'c PulseClient,
+}
+
+impl ConnectorsResource<'_> {
+    /// `GET /api/pulse/connectors` — `{"sources": [...], "sinks": [...]}`.
+    pub async fn list(&self) -> Result<Value, PulseError> {
+        self.client
+            .request(Method::GET, "/api/pulse/connectors", None::<&()>, true)
+            .await
+    }
+
+    /// Just the sink connectors.
+    pub async fn sinks(&self) -> Result<Vec<Value>, PulseError> {
+        Ok(unwrap_list(&self.list().await?, "sinks"))
+    }
+
+    /// Just the source connectors.
+    pub async fn sources(&self) -> Result<Vec<Value>, PulseError> {
+        Ok(unwrap_list(&self.list().await?, "sources"))
+    }
 }

@@ -32,6 +32,7 @@ use bytes::BytesMut;
 use futures_core::Stream;
 use futures_util::StreamExt;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CACHE_CONTROL};
+use reqwest::Method;
 use serde_json::Value;
 
 use crate::client::PulseClient;
@@ -113,7 +114,79 @@ impl<'c> EventsResource<'c> {
             done: false,
         })
     }
+
+    /// `GET /api/pulse/iq/agents/{affecting_state}/state/replay/{key}?from=&to=&limit=`
+    /// — B-113 state-change replay.
+    ///
+    /// Returns the ordered list of changes that touched a state key between
+    /// two instants. `affecting_state` is the agent whose state store to
+    /// inspect; `key` is the state key. `from` / `to` accept the same specs
+    /// as `iq().get_as_of(...)` (`now`, `-1h`, ISO-8601, epoch millis);
+    /// `limit` caps the number of changes (server default 100). Each change
+    /// carries `timestamp`, `changeType` (`PUT` / `DELETE`), the resulting
+    /// `value`, and `eventId` when known. The server's enclosing
+    /// `{..., changes:[...]}` envelope is unwrapped — only the `changes`
+    /// array is returned (empty when the response omits it).
+    ///
+    /// ```no_run
+    /// # use pulse_client::PulseClient;
+    /// # async fn run(client: &PulseClient) -> Result<(), pulse_client::PulseError> {
+    /// let changes = client
+    ///     .events()
+    ///     .replay("user-sessions", "u42", "-1h", "now", 100)
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn replay(
+        self,
+        affecting_state: &str,
+        key: &str,
+        from: &str,
+        to: &str,
+        limit: u32,
+    ) -> Result<Vec<Value>, PulseError> {
+        let path = format!(
+            "/api/pulse/iq/agents/{}/state/replay/{}?from={}&to={}&limit={}",
+            encode_segment(affecting_state),
+            encode_segment(key),
+            encode_segment(from),
+            encode_segment(to),
+            limit,
+        );
+        let result = self
+            .client
+            .request(Method::GET, &path, None::<&()>, true)
+            .await?;
+        Ok(result
+            .get("changes")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
+    }
 }
+
+/// Percent-encodes a path/query segment — same aggressive semantics as the
+/// IQ resource so a key like `"user:123/orders"` produces identical URL
+/// bytes across the Pulse SDKs.
+fn encode_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0xF) as usize] as char);
+            }
+        }
+    }
+    out
+}
+
+const HEX: &[u8; 16] = b"0123456789ABCDEF";
 
 /// `Stream<Item = Result<Value, PulseError>>` — yields parsed SSE events.
 ///
