@@ -5,9 +5,10 @@
 //! the client speaks against the Pulse OpenAPI spec, not to exercise a
 //! real Pulse server.
 
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use pulse_client::{
-    iq_and, iq_leaf, iq_or, IQQueryOptions, IQScanOptions, PulseClient, PulseError,
+    derive_ws_url, iq_and, iq_leaf, iq_or, IQQueryOptions, IQScanOptions, MlPredictOptions,
+    ModelUpload, PulseClient, PulseError,
 };
 use serde_json::json;
 use wiremock::matchers::{
@@ -1237,7 +1238,8 @@ async fn iq_filter_helpers_build_correct_shape() {
 
 use pulse_client::{
     aggs, windows, BranchSpec, BroadcastJoinOptions, CdcJoinOptions, CepOptions,
-    EnrichAsyncOptions, MapOptions, StreamBuilder, WindowOptions, WindowSpec,
+    EnrichAsyncOptions, ExtractOptions, MapLlmOptions, MapOptions, McpCallOptions, StreamBuilder,
+    WindowOptions, WindowSpec,
 };
 use std::collections::BTreeMap;
 
@@ -1569,6 +1571,118 @@ fn stream_cep_rejects_empty_sequence() {
     let _ = StreamBuilder::anonymous()
         .from_topic("in")
         .cep(vec![], CepOptions::default());
+}
+
+// ----- B-109 map_llm / extract / mcp_call -----
+
+#[test]
+fn stream_map_llm_full_shape() {
+    let b = StreamBuilder::anonymous().from_topic("in").map_llm(
+        "Summarise: {body}",
+        MapLlmOptions {
+            output_field: "summary".into(),
+            model: Some("gemma3:7b".into()),
+            temperature: Some(0.0),
+            max_tokens: Some(64),
+            parallelism: Some(8),
+            ordering: Some("UNORDERED".into()),
+            on_failure: Some("PASS_THROUGH".into()),
+            max_calls_per_sec: Some(50),
+        },
+    );
+    let ops = ops_of(&b);
+    assert_eq!(ops[0]["type"], "mapLlm");
+    assert_eq!(ops[0]["prompt"], "Summarise: {body}");
+    assert_eq!(ops[0]["outputField"], "summary");
+    assert_eq!(ops[0]["model"], "gemma3:7b");
+    assert_eq!(ops[0]["ordering"], "UNORDERED");
+    assert_eq!(ops[0]["onFailure"], "PASS_THROUGH");
+    assert_eq!(ops[0]["maxCallsPerSec"], 50);
+}
+
+#[test]
+#[should_panic(expected = "output_field")]
+fn stream_map_llm_rejects_blank_output_field() {
+    let _ = StreamBuilder::anonymous().from_topic("in").map_llm(
+        "p",
+        MapLlmOptions {
+            output_field: "".into(),
+            ..Default::default()
+        },
+    );
+}
+
+#[test]
+fn stream_extract_full_shape() {
+    let mut schema = BTreeMap::new();
+    schema.insert("intent".into(), "string".into());
+    schema.insert("urgency".into(), "int".into());
+    let b = StreamBuilder::anonymous()
+        .from_topic("in")
+        .extract(ExtractOptions {
+            instruction: "Extract intent and urgency".into(),
+            schema,
+            model: Some("gemma3:7b".into()),
+            temperature: Some(0.0),
+            ..Default::default()
+        });
+    let ops = ops_of(&b);
+    assert_eq!(ops[0]["type"], "extract");
+    assert_eq!(ops[0]["instruction"], "Extract intent and urgency");
+    assert_eq!(ops[0]["schema"]["intent"], "string");
+    assert_eq!(ops[0]["schema"]["urgency"], "int");
+}
+
+#[test]
+#[should_panic(expected = "non-empty schema")]
+fn stream_extract_rejects_empty_schema() {
+    let _ = StreamBuilder::anonymous()
+        .from_topic("in")
+        .extract(ExtractOptions {
+            instruction: "x".into(),
+            ..Default::default()
+        });
+}
+
+#[test]
+fn stream_mcp_call_full_shape() {
+    let mut args = BTreeMap::new();
+    args.insert("customer_id".into(), json!("{customerId}"));
+    let b = StreamBuilder::anonymous().from_topic("in").mcp_call(
+        "crm.lookup_customer",
+        McpCallOptions {
+            args: Some(args),
+            output_field: Some("customer".into()),
+            parallelism: Some(4),
+            ordering: Some("UNORDERED".into()),
+            on_failure: Some("EMIT_ERROR".into()),
+        },
+    );
+    let ops = ops_of(&b);
+    assert_eq!(ops[0]["type"], "mcpCall");
+    assert_eq!(ops[0]["tool"], "crm.lookup_customer");
+    assert_eq!(ops[0]["args"]["customer_id"], "{customerId}");
+    assert_eq!(ops[0]["outputField"], "customer");
+    assert_eq!(ops[0]["onFailure"], "EMIT_ERROR");
+}
+
+#[test]
+fn stream_mcp_call_minimal_fire_and_forget() {
+    let b = StreamBuilder::anonymous()
+        .from_topic("in")
+        .mcp_call("pagerduty.create_incident", McpCallOptions::default());
+    let ops = ops_of(&b);
+    assert_eq!(ops[0]["type"], "mcpCall");
+    assert_eq!(ops[0]["tool"], "pagerduty.create_incident");
+    assert!(!ops[0].contains_key("args"));
+}
+
+#[test]
+#[should_panic(expected = "tool")]
+fn stream_mcp_call_rejects_blank_tool() {
+    let _ = StreamBuilder::anonymous()
+        .from_topic("in")
+        .mcp_call("", McpCallOptions::default());
 }
 
 #[test]
@@ -1932,4 +2046,362 @@ async fn streams_deploy_without_token_raises_no_token_synchronously() {
     let b = StreamBuilder::new("p").from_topic("in").filter("x > 0");
     let err = client.streams().deploy(&b).await.unwrap_err();
     assert!(matches!(err, PulseError::NoToken { .. }));
+}
+
+// ---------------------------------------------------------------------------
+// B-112 — ml_predict operator shape (StreamBuilder)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ml_predict_minimal_shape() {
+    let b = StreamBuilder::anonymous()
+        .from_topic("tx")
+        .ml_predict(MlPredictOptions {
+            model: "fraud".into(),
+            input_fields: vec!["amount".into(), "country".into()],
+            output_field: "prediction".into(),
+            ..Default::default()
+        });
+    let ops = ops_of(&b);
+    assert_eq!(ops.len(), 1);
+    let op = &ops[0];
+    assert_eq!(op["type"], "mlPredict");
+    assert_eq!(op["model"], "fraud");
+    assert_eq!(op["inputFields"], json!(["amount", "country"]));
+    assert_eq!(op["outputField"], "prediction");
+    assert!(!op.contains_key("parallelism"));
+    assert!(!op.contains_key("ordering"));
+    assert!(!op.contains_key("onFailure"));
+}
+
+#[test]
+fn ml_predict_full_shape() {
+    let b = StreamBuilder::anonymous()
+        .from_topic("tx")
+        .ml_predict(MlPredictOptions {
+            model: "fraud".into(),
+            input_fields: vec!["amount".into()],
+            output_field: "p".into(),
+            parallelism: Some(8),
+            ordering: Some("UNORDERED".into()),
+            on_failure: Some("PASS_THROUGH".into()),
+        });
+    let op = &ops_of(&b)[0];
+    assert_eq!(op["parallelism"], 8);
+    assert_eq!(op["ordering"], "UNORDERED");
+    assert_eq!(op["onFailure"], "PASS_THROUGH");
+}
+
+#[test]
+#[should_panic(expected = "model")]
+fn ml_predict_blank_model_panics() {
+    let _ = StreamBuilder::anonymous()
+        .from_topic("tx")
+        .ml_predict(MlPredictOptions {
+            model: "".into(),
+            input_fields: vec!["a".into()],
+            output_field: "p".into(),
+            ..Default::default()
+        });
+}
+
+#[test]
+#[should_panic(expected = "input_fields")]
+fn ml_predict_empty_input_fields_panics() {
+    let _ = StreamBuilder::anonymous()
+        .from_topic("tx")
+        .ml_predict(MlPredictOptions {
+            model: "m".into(),
+            input_fields: vec![],
+            output_field: "p".into(),
+            ..Default::default()
+        });
+}
+
+#[test]
+#[should_panic(expected = "input_fields")]
+fn ml_predict_blank_input_field_panics() {
+    let _ = StreamBuilder::anonymous()
+        .from_topic("tx")
+        .ml_predict(MlPredictOptions {
+            model: "m".into(),
+            input_fields: vec!["ok".into(), "  ".into()],
+            output_field: "p".into(),
+            ..Default::default()
+        });
+}
+
+#[test]
+#[should_panic(expected = "ordering")]
+fn ml_predict_bad_ordering_panics() {
+    let _ = StreamBuilder::anonymous()
+        .from_topic("tx")
+        .ml_predict(MlPredictOptions {
+            model: "m".into(),
+            input_fields: vec!["a".into()],
+            output_field: "p".into(),
+            ordering: Some("SOMETIMES".into()),
+            ..Default::default()
+        });
+}
+
+// ---------------------------------------------------------------------------
+// B-112 — ModelsResource (client.models())
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn models_list_unwraps_envelope() {
+    let server = start_server().await;
+    Mock::given(method("GET"))
+        .and(path("/api/pulse/ml-models"))
+        .and(header_exists("authorization"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "models": [{ "name": "fraud", "runtime": "onnx" }]
+        })))
+        .mount(&server)
+        .await;
+
+    let client = new_client(&server, Some("fake.jwt"));
+    let models = client.models().list().await.unwrap();
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0]["name"], "fraud");
+}
+
+#[tokio::test]
+async fn models_get_by_name() {
+    let server = start_server().await;
+    Mock::given(method("GET"))
+        .and(path("/api/pulse/ml-models/fraud"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "name": "fraud", "runtime": "onnx", "version": 3
+        })))
+        .mount(&server)
+        .await;
+
+    let client = new_client(&server, Some("fake.jwt"));
+    let m = client.models().get("fraud").await.unwrap();
+    assert_eq!(m["version"], 3);
+}
+
+#[tokio::test]
+async fn models_delete() {
+    let server = start_server().await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/pulse/ml-models/fraud"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+
+    let client = new_client(&server, Some("fake.jwt"));
+    client.models().delete("fraud").await.unwrap();
+}
+
+#[tokio::test]
+async fn models_upload_sends_multipart_form() {
+    let server = start_server().await;
+    Mock::given(method("POST"))
+        .and(path("/api/pulse/ml-models"))
+        .and(header_exists("authorization"))
+        // multipart boundary → content-type starts with multipart/form-data
+        .and(wiremock::matchers::header_regex(
+            "content-type",
+            "multipart/form-data",
+        ))
+        // the text parts + file part name land in the body
+        .and(body_string_contains("name=\"name\""))
+        .and(body_string_contains("fraud-classifier"))
+        .and(body_string_contains("name=\"runtime\""))
+        .and(body_string_contains("onnx"))
+        .and(body_string_contains("name=\"model\""))
+        .and(body_string_contains("name=\"inputSchema\""))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "name": "fraud-classifier", "runtime": "onnx", "sha256": "deadbeef"
+        })))
+        .mount(&server)
+        .await;
+
+    let client = new_client(&server, Some("fake.jwt"));
+    let mut input = BTreeMap::new();
+    input.insert("amount".to_string(), "float".to_string());
+    let meta = client
+        .models()
+        .upload(
+            ModelUpload::from_bytes("fraud-classifier", b"\x08\x01onnx-bytes".to_vec())
+                .input_schema(input),
+        )
+        .await
+        .unwrap();
+    assert_eq!(meta["sha256"], "deadbeef");
+}
+
+#[tokio::test]
+async fn models_upload_blank_name_is_invalid_config() {
+    let server = start_server().await;
+    let client = new_client(&server, Some("fake.jwt"));
+    let err = client
+        .models()
+        .upload(ModelUpload::from_bytes("  ", b"x".to_vec()))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, PulseError::InvalidConfig(_)));
+}
+
+#[tokio::test]
+async fn models_upload_requires_exactly_one_source() {
+    let server = start_server().await;
+    let client = new_client(&server, Some("fake.jwt"));
+    // Neither path nor data → InvalidConfig (constructed by hand).
+    let upload = ModelUpload {
+        name: "m".into(),
+        ..Default::default()
+    };
+    let err = client.models().upload(upload).await.unwrap_err();
+    assert!(matches!(err, PulseError::InvalidConfig(_)));
+}
+
+#[tokio::test]
+async fn models_upload_empty_bytes_is_invalid_config() {
+    let server = start_server().await;
+    let client = new_client(&server, Some("fake.jwt"));
+    let err = client
+        .models()
+        .upload(ModelUpload::from_bytes("m", Vec::new()))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, PulseError::InvalidConfig(_)));
+}
+
+// ---------------------------------------------------------------------------
+// B-114 — Duplex URL derivation (mirrors pulse-py derive_ws_url)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn duplex_url_http_bumps_port_and_carries_token() {
+    let url = derive_ws_url("http://localhost:9090", "fraud", Some("ey.jwt"));
+    assert_eq!(
+        url,
+        "ws://localhost:9091/api/pulse/agents/fraud/duplex?token=ey.jwt"
+    );
+}
+
+#[test]
+fn duplex_url_https_is_wss() {
+    let url = derive_ws_url("https://h:443", "a", None);
+    assert_eq!(url, "wss://h:444/api/pulse/agents/a/duplex");
+}
+
+// ---------------------------------------------------------------------------
+// B-114 — Duplex WebSocket round-trip against a real tokio-tungstenite server
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn duplex_round_trip() {
+    use tokio_tungstenite::tungstenite::Message;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    // Server: send `connected`, then for each `send` echo an `ack` + `output`.
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        ws.send(Message::text(
+            json!({ "type": "connected", "agentId": "fraud" }).to_string(),
+        ))
+        .await
+        .unwrap();
+
+        while let Some(Ok(msg)) = ws.next().await {
+            if let Message::Text(text) = msg {
+                let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if v["type"] == "send" {
+                    let cid = v["correlationId"].clone();
+                    let amount = v["payload"]["amount"].clone();
+                    ws.send(Message::text(
+                        json!({ "type": "ack", "correlationId": cid }).to_string(),
+                    ))
+                    .await
+                    .unwrap();
+                    ws.send(Message::text(
+                        json!({
+                            "type": "output",
+                            "correlationId": cid,
+                            "event": { "payload": { "decision": "DENY", "echo": amount } }
+                        })
+                        .to_string(),
+                    ))
+                    .await
+                    .unwrap();
+                }
+            } else if let Message::Close(_) = msg {
+                break;
+            }
+        }
+    });
+
+    // The client derives ws://host:port+1 from base_url, so bind base_url to
+    // port-1 and point duplex_at directly at the real server URL instead.
+    let client = PulseClient::builder()
+        .base_url("http://127.0.0.1:1")
+        .build()
+        .unwrap();
+    let ws_url = format!("ws://{addr}/api/pulse/agents/fraud/duplex");
+    let mut ch = client.duplex_at(ws_url).await.unwrap();
+
+    let cid = ch
+        .send(&json!({ "amount": 5000 }), Some("tx-1"))
+        .await
+        .unwrap();
+    assert_eq!(cid, "tx-1");
+
+    let out = ch.recv().await.unwrap();
+    assert_eq!(out.correlation_id.as_deref(), Some("tx-1"));
+    assert_eq!(out.event["payload"]["decision"], "DENY");
+    assert_eq!(out.event["payload"]["echo"], 5000);
+
+    // A generated correlation id round-trips too.
+    let cid2 = ch.send(&json!({ "amount": 1 }), None).await.unwrap();
+    let out2 = ch.recv().await.unwrap();
+    assert_eq!(out2.correlation_id.as_deref(), Some(cid2.as_str()));
+
+    ch.close().await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn duplex_server_error_frame_on_open_is_validation_error() {
+    use tokio_tungstenite::tungstenite::Message;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        ws.send(Message::text(
+            json!({ "type": "error", "error": "unknown agent" }).to_string(),
+        ))
+        .await
+        .unwrap();
+        let _ = ws.close(None).await;
+    });
+
+    let client = PulseClient::builder()
+        .base_url("http://127.0.0.1:1")
+        .build()
+        .unwrap();
+    let ws_url = format!("ws://{addr}/api/pulse/agents/nope/duplex");
+    let err = client.duplex_at(ws_url).await.unwrap_err();
+    assert!(matches!(err, PulseError::Validation { .. }));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn duplex_blank_agent_id_is_invalid_config() {
+    let client = PulseClient::builder()
+        .base_url("http://localhost:9090")
+        .build()
+        .unwrap();
+    let err = client.duplex("   ").await.unwrap_err();
+    assert!(matches!(err, PulseError::InvalidConfig(_)));
 }

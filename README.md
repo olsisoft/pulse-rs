@@ -1,6 +1,6 @@
 # pulse-client — Rust SDK for StreamFlow Pulse
 
-Official Rust client for [Pulse](https://github.com/olsisoft/streamflow) — the AI Agent Platform. Async-first, **`reqwest` + `serde`** stack, **MSRV 1.82**.
+Official Rust client for [Pulse](https://github.com/olsisoft/pulse-rs) — the AI Agent Platform. Async-first, **`reqwest` + `serde`** stack, **MSRV 1.82**.
 
 ```rust
 use pulse_client::PulseClient;
@@ -105,6 +105,35 @@ Every method returns `impl Future<Output = Result<Value, PulseError>>`. `Value` 
 
 Full ~112-endpoint surface documented in Swagger UI at `<pulse-server>/api-docs`. Less-used methods land opportunistically as user-facing demand surfaces.
 
+## Embedded ML inference & duplex
+
+Score events with an uploaded ONNX model in-process (B-112), and open a
+bidirectional duplex channel for synchronous decisions (B-114). Full guide:
+[ML inference & duplex](https://github.com/olsisoft/pulse-rs/blob/dev/docs/SDK-ML-INFERENCE-AND-DUPLEX.md).
+
+```rust
+use pulse_client::{ModelUpload, MlPredictOptions};
+use std::collections::BTreeMap;
+
+// Upload + score with an ONNX model (no model-server hop)
+let schema = BTreeMap::from([("amount".into(), "float".into()), ("country".into(), "float".into())]);
+client.models().upload(ModelUpload::from_path("fraud", "./fraud.onnx").input_schema(schema)).await?;
+builder.from_topic("transactions")
+    .ml_predict(MlPredictOptions {
+        model: "fraud".into(),
+        input_fields: vec!["amount".into(), "country".into()],
+        output_field: "prediction".into(),
+        ..Default::default()
+    })
+    .filter("prediction.fraud_score > 0.8").to_topic("flagged");
+
+// Duplex: one connection, send in / receive the correlated output
+let mut ch = client.duplex("fraud-detector").await?;
+let cid = ch.send(&serde_json::json!({ "amount": 5000 }), Some("tx-1")).await?;
+let out = ch.recv().await?;   // out.correlation_id == Some("tx-1")
+ch.close().await?;
+```
+
 ## Authentication
 
 Three patterns:
@@ -174,8 +203,8 @@ let client = PulseClient::builder()
 ## Development
 
 ```bash
-git clone https://github.com/olsisoft/streamflow.git
-cd streamflow/pulse-rs
+git clone https://github.com/olsisoft/pulse-rs.git
+cd pulse-rs
 
 cargo build
 cargo test
