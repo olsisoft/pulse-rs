@@ -9,11 +9,13 @@ use reqwest::StatusCode;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::duplex::{derive_ws_url, DuplexChannel};
 use crate::error::PulseError;
 use crate::events::EventsResource;
 use crate::iq::IQResource;
 use crate::resources::{
-    AgentsResource, AuthResource, PipelinesResource, TemplatesResource, UsersResource,
+    AgentsResource, AuthResource, ConnectorsResource, ModelsResource, PipelinesResource,
+    TemplatesResource, UsersResource,
 };
 use crate::streams::StreamsResource;
 
@@ -105,6 +107,18 @@ impl PulseClient {
         UsersResource { client: self }
     }
 
+    /// `client.models()` — B-112 embedded ML model registry (upload / list /
+    /// get / delete ONNX models scored by the streaming `ml_predict` operator).
+    pub fn models(&self) -> ModelsResource<'_> {
+        ModelsResource { client: self }
+    }
+
+    /// `client.connectors()` — the connector catalogue (B-093 family + every
+    /// native / bridged connector); use a `subType` as a pipeline node `type`.
+    pub fn connectors(&self) -> ConnectorsResource<'_> {
+        ConnectorsResource { client: self }
+    }
+
     pub fn events(&self) -> EventsResource<'_> {
         EventsResource { client: self }
     }
@@ -116,6 +130,50 @@ impl PulseClient {
     /// `client.streams()` — B-107 Kafka-Streams-like declarative DSL.
     pub fn streams(&self) -> StreamsResource<'_> {
         StreamsResource { client: self }
+    }
+
+    /// B-114 — open a bidirectional duplex channel to an agent.
+    ///
+    /// Streams events IN and receives the agent's correlated outputs OUT on a
+    /// single WebSocket — the synchronous-decision path (fraud, pricing, A/B
+    /// assignment). The endpoint runs on the Pulse WebSocket port (REST port
+    /// + 1); the URL is derived from this client's `base_url` + token.
+    ///
+    /// ```no_run
+    /// # use pulse_client::PulseClient;
+    /// # use serde_json::json;
+    /// # async fn run(client: &PulseClient) -> Result<(), pulse_client::PulseError> {
+    /// let mut ch = client.duplex("fraud-detector").await?;
+    /// let cid = ch.send(&json!({ "amount": 5000 }), Some("tx-1")).await?;
+    /// let output = ch.recv().await?;
+    /// assert_eq!(output.correlation_id, Some(cid));
+    /// ch.close().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// - [`PulseError::InvalidConfig`] if `agent_id` is blank.
+    /// - [`PulseError::Duplex`] on a WebSocket handshake / transport failure.
+    /// - [`PulseError::Validation`] if the server rejects the agent with an
+    ///   `error` frame on open.
+    pub async fn duplex(&self, agent_id: &str) -> Result<DuplexChannel, PulseError> {
+        if agent_id.trim().is_empty() {
+            return Err(PulseError::InvalidConfig(
+                "agent_id must be a non-empty string".to_string(),
+            ));
+        }
+        let token = self.token();
+        let url = derive_ws_url(&self.inner.base_url, agent_id, token.as_deref());
+        DuplexChannel::connect(url).await
+    }
+
+    /// Open a duplex channel at an explicit WebSocket URL, bypassing the
+    /// REST-port-+-1 derivation. Useful when the WebSocket endpoint sits
+    /// behind a separate gateway / hostname.
+    pub async fn duplex_at(&self, ws_url: impl Into<String>) -> Result<DuplexChannel, PulseError> {
+        DuplexChannel::connect(ws_url.into()).await
     }
 
     /// `GET /api/pulse/version` — public, no JWT required. Returns the
@@ -192,6 +250,73 @@ impl PulseClient {
             }
         };
 
+        Err(translate_error(
+            status,
+            path,
+            parsed_body,
+            retry_after_header,
+        ))
+    }
+
+    /// B-112 — issue a `multipart/form-data` POST (the ML model-upload path).
+    ///
+    /// Shares the auth + error-translation logic of [`request`](Self::request)
+    /// but sends a pre-built [`reqwest::multipart::Form`] instead of a JSON
+    /// body. Always authenticated.
+    pub(crate) async fn request_multipart(
+        &self,
+        path: &str,
+        form: reqwest::multipart::Form,
+    ) -> Result<Value, PulseError> {
+        let url = format!("{}{path}", self.inner.base_url);
+        let token = match self.token() {
+            Some(token) if !token.is_empty() => token,
+            _ => {
+                return Err(PulseError::NoToken {
+                    path: path.to_string(),
+                });
+            }
+        };
+
+        let response = self
+            .inner
+            .http
+            .request(Method::POST, url)
+            .bearer_auth(token)
+            .multipart(form)
+            .send()
+            .await?;
+        let status = response.status();
+
+        if status == StatusCode::NO_CONTENT {
+            return Ok(Value::Object(Default::default()));
+        }
+        if status.is_success() {
+            let bytes = response.bytes().await?;
+            if bytes.is_empty() {
+                return Ok(Value::Object(Default::default()));
+            }
+            return Ok(serde_json::from_slice(&bytes)?);
+        }
+
+        let retry_after_header = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u32>().ok());
+        let bytes = response.bytes().await?;
+        let parsed_body: Option<Value> = if bytes.is_empty() {
+            None
+        } else {
+            match serde_json::from_slice::<Value>(&bytes) {
+                Ok(v) => Some(v),
+                Err(_) => {
+                    let raw = String::from_utf8_lossy(&bytes);
+                    let trimmed = if raw.len() > 200 { &raw[..200] } else { &raw };
+                    Some(serde_json::json!({ "error": trimmed }))
+                }
+            }
+        };
         Err(translate_error(
             status,
             path,
