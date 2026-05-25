@@ -1,4 +1,4 @@
-//! Official Rust client for [StreamFlow Pulse](https://github.com/olsisoft/streamflow)
+//! Official Rust client for [StreamFlow Pulse](https://github.com/olsisoft/pulse-rs)
 //! — the AI Agent Platform.
 //!
 //! # Quick start
@@ -63,7 +63,8 @@ pub use resources::{
 };
 pub use streams::{
     aggs, windows, BranchSpec, BroadcastJoinOptions, CdcJoinOptions, CepOptions,
-    EnrichAsyncOptions, MapOptions, StreamBuilder, StreamsResource, WindowOptions, WindowSpec,
+    EnrichAsyncOptions, ExtractOptions, MapLlmOptions, MapOptions, McpCallOptions, StreamBuilder,
+    StreamsResource, WindowOptions, WindowSpec,
 };
 
 // Re-export serde_json::Value so callers don't need to add serde_json to

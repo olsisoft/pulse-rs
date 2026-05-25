@@ -1237,7 +1237,8 @@ async fn iq_filter_helpers_build_correct_shape() {
 
 use pulse_client::{
     aggs, windows, BranchSpec, BroadcastJoinOptions, CdcJoinOptions, CepOptions,
-    EnrichAsyncOptions, MapOptions, StreamBuilder, WindowOptions, WindowSpec,
+    EnrichAsyncOptions, ExtractOptions, MapLlmOptions, MapOptions, McpCallOptions, StreamBuilder,
+    WindowOptions, WindowSpec,
 };
 use std::collections::BTreeMap;
 
@@ -1569,6 +1570,118 @@ fn stream_cep_rejects_empty_sequence() {
     let _ = StreamBuilder::anonymous()
         .from_topic("in")
         .cep(vec![], CepOptions::default());
+}
+
+// ----- B-109 map_llm / extract / mcp_call -----
+
+#[test]
+fn stream_map_llm_full_shape() {
+    let b = StreamBuilder::anonymous().from_topic("in").map_llm(
+        "Summarise: {body}",
+        MapLlmOptions {
+            output_field: "summary".into(),
+            model: Some("gemma3:7b".into()),
+            temperature: Some(0.0),
+            max_tokens: Some(64),
+            parallelism: Some(8),
+            ordering: Some("UNORDERED".into()),
+            on_failure: Some("PASS_THROUGH".into()),
+            max_calls_per_sec: Some(50),
+        },
+    );
+    let ops = ops_of(&b);
+    assert_eq!(ops[0]["type"], "mapLlm");
+    assert_eq!(ops[0]["prompt"], "Summarise: {body}");
+    assert_eq!(ops[0]["outputField"], "summary");
+    assert_eq!(ops[0]["model"], "gemma3:7b");
+    assert_eq!(ops[0]["ordering"], "UNORDERED");
+    assert_eq!(ops[0]["onFailure"], "PASS_THROUGH");
+    assert_eq!(ops[0]["maxCallsPerSec"], 50);
+}
+
+#[test]
+#[should_panic(expected = "output_field")]
+fn stream_map_llm_rejects_blank_output_field() {
+    let _ = StreamBuilder::anonymous().from_topic("in").map_llm(
+        "p",
+        MapLlmOptions {
+            output_field: "".into(),
+            ..Default::default()
+        },
+    );
+}
+
+#[test]
+fn stream_extract_full_shape() {
+    let mut schema = BTreeMap::new();
+    schema.insert("intent".into(), "string".into());
+    schema.insert("urgency".into(), "int".into());
+    let b = StreamBuilder::anonymous()
+        .from_topic("in")
+        .extract(ExtractOptions {
+            instruction: "Extract intent and urgency".into(),
+            schema,
+            model: Some("gemma3:7b".into()),
+            temperature: Some(0.0),
+            ..Default::default()
+        });
+    let ops = ops_of(&b);
+    assert_eq!(ops[0]["type"], "extract");
+    assert_eq!(ops[0]["instruction"], "Extract intent and urgency");
+    assert_eq!(ops[0]["schema"]["intent"], "string");
+    assert_eq!(ops[0]["schema"]["urgency"], "int");
+}
+
+#[test]
+#[should_panic(expected = "non-empty schema")]
+fn stream_extract_rejects_empty_schema() {
+    let _ = StreamBuilder::anonymous()
+        .from_topic("in")
+        .extract(ExtractOptions {
+            instruction: "x".into(),
+            ..Default::default()
+        });
+}
+
+#[test]
+fn stream_mcp_call_full_shape() {
+    let mut args = BTreeMap::new();
+    args.insert("customer_id".into(), json!("{customerId}"));
+    let b = StreamBuilder::anonymous().from_topic("in").mcp_call(
+        "crm.lookup_customer",
+        McpCallOptions {
+            args: Some(args),
+            output_field: Some("customer".into()),
+            parallelism: Some(4),
+            ordering: Some("UNORDERED".into()),
+            on_failure: Some("EMIT_ERROR".into()),
+        },
+    );
+    let ops = ops_of(&b);
+    assert_eq!(ops[0]["type"], "mcpCall");
+    assert_eq!(ops[0]["tool"], "crm.lookup_customer");
+    assert_eq!(ops[0]["args"]["customer_id"], "{customerId}");
+    assert_eq!(ops[0]["outputField"], "customer");
+    assert_eq!(ops[0]["onFailure"], "EMIT_ERROR");
+}
+
+#[test]
+fn stream_mcp_call_minimal_fire_and_forget() {
+    let b = StreamBuilder::anonymous()
+        .from_topic("in")
+        .mcp_call("pagerduty.create_incident", McpCallOptions::default());
+    let ops = ops_of(&b);
+    assert_eq!(ops[0]["type"], "mcpCall");
+    assert_eq!(ops[0]["tool"], "pagerduty.create_incident");
+    assert!(!ops[0].contains_key("args"));
+}
+
+#[test]
+#[should_panic(expected = "tool")]
+fn stream_mcp_call_rejects_blank_tool() {
+    let _ = StreamBuilder::anonymous()
+        .from_topic("in")
+        .mcp_call("", McpCallOptions::default());
 }
 
 #[test]
