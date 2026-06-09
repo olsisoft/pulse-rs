@@ -214,6 +214,39 @@ cargo doc --no-deps --open
 
 CI runs the same on every push touching `pulse-rs/` — see `.github/workflows/pulse-rs.yaml`.
 
+## Automatic retry (opt-in)
+
+Off by default — one attempt per request. Enable bounded, full-jitter
+exponential-backoff retries via `RetryPolicy`:
+
+```rust
+use pulse_client::RetryPolicy;
+
+let client = PulseClient::builder()
+    .base_url("http://localhost:9090")
+    .retry(RetryPolicy::with_max_retries(3))   // or a full RetryPolicy { .. }
+    .build()?;
+```
+
+429 (rate limited) is retried for any method, honouring `Retry-After`;
+`on_status` 5xx (default `502/503/504`) and transport errors are retried only for
+idempotent methods (GET/HEAD/PUT/DELETE) unless `retry_non_idempotent`; terminal
+4xx are never retried.
+
+## Local pipeline simulation (Python-only today)
+
+The streams DSL is **client-side declaration, server-side execution**:
+`streams().compile(&builder)` builds the pipeline JSON locally (no network) and
+`streams().deploy(&builder)` runs it on the Pulse engine. This SDK has **no
+in-process simulator** — to validate a pipeline before deploy, `compile()` and
+inspect the JSON, or deploy to a dev Pulse.
+
+> A local `TopologyTestDriver`-style executor that runs a streams pipeline
+> in-process over sample events (`StreamBuilder::simulate(events)`) currently
+> exists **only in the Python SDK** (`streamflow-pulse-client`). Cross-language
+> parity is tracked as **B-169** (issue #311); until then, local simulation is a
+> Python-exclusive capability.
+
 ## Roadmap
 
 - **v2.5.x** — current async API, 5 core resources, `version()`.
