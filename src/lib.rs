@@ -55,19 +55,19 @@ mod iq;
 mod resources;
 mod streams;
 
-pub use client::{PulseClient, PulseClientBuilder};
+pub use client::{PulseClient, PulseClientBuilder, RetryPolicy};
 pub use duplex::{derive_ws_url, DuplexChannel, DuplexOutput};
 pub use error::PulseError;
 pub use events::{EventsResource, EventsStream};
 pub use iq::{iq_and, iq_leaf, iq_not, iq_or, IQQueryOptions, IQResource, IQScanOptions};
 pub use resources::{
-    AgentsResource, AuthResource, ConnectorsResource, ModelUpload, ModelsResource,
-    PipelinesResource, TemplatesResource, UsersResource,
+    validate_wasm_module, AgentsResource, AuthResource, ConnectorsResource, ModelUpload,
+    ModelsResource, PipelinesResource, TemplatesResource, UsersResource, WasmResource, WasmUpload,
 };
 pub use streams::{
     aggs, windows, BranchSpec, BroadcastJoinOptions, CdcJoinOptions, CepOptions,
     EnrichAsyncOptions, ExtractOptions, MapLlmOptions, MapOptions, McpCallOptions,
-    MlPredictOptions, StreamBuilder, StreamsResource, WindowOptions, WindowSpec,
+    MlPredictOptions, StreamBuilder, StreamsResource, WasmOptions, WindowOptions, WindowSpec,
 };
 
 // Re-export serde_json::Value so callers don't need to add serde_json to
@@ -125,5 +125,11 @@ impl<'c> std::fmt::Debug for ConnectorsResource<'c> {
 impl<'c> std::fmt::Debug for ModelsResource<'c> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ModelsResource").finish()
+    }
+}
+
+impl<'c> std::fmt::Debug for WasmResource<'c> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WasmResource").finish()
     }
 }
