@@ -8,7 +8,7 @@
 use futures_util::{SinkExt, StreamExt};
 use pulse_client::{
     derive_ws_url, iq_and, iq_leaf, iq_or, IQQueryOptions, IQScanOptions, MlPredictOptions,
-    ModelUpload, PulseClient, PulseError,
+    ModelUpload, PulseClient, PulseError, WasmOptions, WasmUpload,
 };
 use serde_json::json;
 use wiremock::matchers::{
@@ -2427,6 +2427,309 @@ async fn models_upload_empty_bytes_is_invalid_config() {
     let err = client
         .models()
         .upload(ModelUpload::from_bytes("m", Vec::new()))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, PulseError::InvalidConfig(_)));
+}
+
+// ---------------------------------------------------------------------------
+// B-110 — wasm operator shape (StreamBuilder)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wasm_minimal_shape() {
+    let b = StreamBuilder::anonymous()
+        .from_topic("events")
+        .wasm(WasmOptions {
+            module: "pii-redactor".into(),
+            ..Default::default()
+        });
+    let ops = ops_of(&b);
+    assert_eq!(ops.len(), 1);
+    let op = &ops[0];
+    assert_eq!(op["type"], "wasm");
+    assert_eq!(op["module"], "pii-redactor");
+    assert!(!op.contains_key("parallelism"));
+    assert!(!op.contains_key("ordering"));
+    assert!(!op.contains_key("onFailure"));
+}
+
+#[test]
+fn wasm_full_shape() {
+    let b = StreamBuilder::anonymous()
+        .from_topic("events")
+        .wasm(WasmOptions {
+            module: "pii-redactor".into(),
+            parallelism: Some(4),
+            ordering: Some("PRESERVE_INPUT".into()),
+            on_failure: Some("DROP".into()),
+        });
+    let op = &ops_of(&b)[0];
+    assert_eq!(op["parallelism"], 4);
+    assert_eq!(op["ordering"], "PRESERVE_INPUT");
+    assert_eq!(op["onFailure"], "DROP");
+}
+
+#[test]
+#[should_panic(expected = "module")]
+fn wasm_blank_module_panics() {
+    let _ = StreamBuilder::anonymous()
+        .from_topic("events")
+        .wasm(WasmOptions {
+            module: "".into(),
+            ..Default::default()
+        });
+}
+
+#[test]
+#[should_panic(expected = "ordering")]
+fn wasm_bad_ordering_panics() {
+    let _ = StreamBuilder::anonymous()
+        .from_topic("events")
+        .wasm(WasmOptions {
+            module: "m".into(),
+            ordering: Some("SOMETIMES".into()),
+            ..Default::default()
+        });
+}
+
+#[test]
+#[should_panic(expected = "on_failure")]
+fn wasm_bad_on_failure_panics() {
+    let _ = StreamBuilder::anonymous()
+        .from_topic("events")
+        .wasm(WasmOptions {
+            module: "m".into(),
+            on_failure: Some("EXPLODE".into()),
+            ..Default::default()
+        });
+}
+
+// ---------------------------------------------------------------------------
+// B-110 — WasmResource (client.wasm())
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn wasm_list_unwraps_envelope() {
+    let server = start_server().await;
+    Mock::given(method("GET"))
+        .and(path("/api/pulse/wasm-modules"))
+        .and(header_exists("authorization"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "modules": [{ "name": "redactor" }]
+        })))
+        .mount(&server)
+        .await;
+
+    let client = new_client(&server, Some("fake.jwt"));
+    let modules = client.wasm().list().await.unwrap();
+    assert_eq!(modules.len(), 1);
+    assert_eq!(modules[0]["name"], "redactor");
+}
+
+#[tokio::test]
+async fn wasm_get_by_name() {
+    let server = start_server().await;
+    Mock::given(method("GET"))
+        .and(path("/api/pulse/wasm-modules/redactor"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "name": "redactor", "version": 2
+        })))
+        .mount(&server)
+        .await;
+
+    let client = new_client(&server, Some("fake.jwt"));
+    let m = client.wasm().get("redactor").await.unwrap();
+    assert_eq!(m["version"], 2);
+}
+
+#[tokio::test]
+async fn wasm_delete() {
+    let server = start_server().await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/pulse/wasm-modules/redactor"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+
+    let client = new_client(&server, Some("fake.jwt"));
+    client.wasm().delete("redactor").await.unwrap();
+}
+
+#[tokio::test]
+async fn wasm_upload_sends_multipart_form() {
+    let server = start_server().await;
+    Mock::given(method("POST"))
+        .and(path("/api/pulse/wasm-modules"))
+        .and(header_exists("authorization"))
+        .and(wiremock::matchers::header_regex(
+            "content-type",
+            "multipart/form-data",
+        ))
+        .and(body_string_contains("name=\"name\""))
+        .and(body_string_contains("redactor"))
+        .and(body_string_contains("name=\"module\""))
+        .and(body_string_contains("name=\"description\""))
+        .and(body_string_contains("pii"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "name": "redactor", "sha256": "deadbeef", "version": 1
+        })))
+        .mount(&server)
+        .await;
+
+    let client = new_client(&server, Some("fake.jwt"));
+    let meta = client
+        .wasm()
+        .upload(WasmUpload::from_bytes("redactor", valid_wasm_module()).description("pii"))
+        .await
+        .unwrap();
+    assert_eq!(meta["sha256"], "deadbeef");
+}
+
+// B-110 — client-side WASM module validation fixtures + tests.
+// ---------------------------------------------------------------------------
+
+/// VALID sandbox module: magic+version, export section listing
+/// alloc / process / memory, no imports.
+fn valid_wasm_module() -> Vec<u8> {
+    vec![
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // magic + version
+        0x07, 0x1c, // export section, size 0x1c
+        0x03, // export count = 3 (alloc, process, memory)
+        0x05, 0x61, 0x6c, 0x6c, 0x6f, 0x63, 0x00, 0x00, // "alloc" func 0
+        0x07, 0x70, 0x72, 0x6f, 0x63, 0x65, 0x73, 0x73, 0x00, 0x00, // "process" func 0
+        0x06, 0x6d, 0x65, 0x6d, 0x6f, 0x72, 0x79, 0x02, 0x00, // "memory" mem 0
+    ]
+}
+
+/// Module that imports an env host function — must be rejected.
+fn wasm_with_import() -> Vec<u8> {
+    vec![
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // magic + version
+        0x02, 0x09, 0x01, 0x03, 0x65, 0x6e, 0x76, 0x01, 0x66, 0x00,
+        0x00, // import section: env.f
+        0x07, 0x1c, 0x01, 0x05, 0x61, 0x6c, 0x6c, 0x6f, 0x63, 0x00, 0x00, 0x07, 0x70, 0x72, 0x6f,
+        0x63, 0x65, 0x73, 0x73, 0x00, 0x00, 0x06, 0x6d, 0x65, 0x6d, 0x6f, 0x72, 0x79, 0x02, 0x00,
+    ]
+}
+
+/// Module whose export section lists only `alloc` — missing process + memory.
+fn wasm_missing_exports() -> Vec<u8> {
+    vec![
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // magic + version
+        0x07, 0x09, // export section, size 9
+        0x01, // export count = 1
+        0x05, 0x61, 0x6c, 0x6c, 0x6f, 0x63, 0x00, 0x00, // "alloc" func 0
+    ]
+}
+
+#[test]
+fn validate_wasm_module_accepts_valid() {
+    pulse_client::validate_wasm_module(&valid_wasm_module()).expect("valid module");
+}
+
+#[test]
+fn validate_wasm_module_rejects_empty() {
+    let err = pulse_client::validate_wasm_module(&[]).unwrap_err();
+    assert!(matches!(err, PulseError::Validation { .. }));
+}
+
+#[test]
+fn validate_wasm_module_rejects_bad_magic() {
+    let bad = vec![0xde, 0xad, 0xbe, 0xef, 0x01, 0x00, 0x00, 0x00];
+    let err = pulse_client::validate_wasm_module(&bad).unwrap_err();
+    assert!(matches!(err, PulseError::Validation { .. }));
+}
+
+#[test]
+fn validate_wasm_module_rejects_host_import() {
+    let err = pulse_client::validate_wasm_module(&wasm_with_import()).unwrap_err();
+    assert!(matches!(err, PulseError::Validation { .. }));
+}
+
+#[test]
+fn validate_wasm_module_rejects_missing_export() {
+    let err = pulse_client::validate_wasm_module(&wasm_missing_exports()).unwrap_err();
+    assert!(matches!(err, PulseError::Validation { .. }));
+}
+
+#[tokio::test]
+async fn wasm_upload_rejects_bad_module_without_network_call() {
+    let server = start_server().await;
+    // No mock mounted — if the client reached the wire, the request would 404,
+    // but validation must short-circuit before any network call.
+    let client = new_client(&server, Some("fake.jwt"));
+    let err = client
+        .wasm()
+        .upload(WasmUpload::from_bytes("redactor", wasm_with_import()))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, PulseError::Validation { .. }));
+
+    let received = server.received_requests().await.unwrap();
+    assert!(
+        received.is_empty(),
+        "client should not have reached the wire on a bad module"
+    );
+}
+
+#[tokio::test]
+async fn wasm_upload_rejects_missing_exports_without_network_call() {
+    let server = start_server().await;
+    let client = new_client(&server, Some("fake.jwt"));
+    let err = client
+        .wasm()
+        .upload(WasmUpload::from_bytes("redactor", wasm_missing_exports()))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, PulseError::Validation { .. }));
+
+    let received = server.received_requests().await.unwrap();
+    assert!(received.is_empty());
+}
+
+#[tokio::test]
+async fn wasm_upload_blank_name_is_invalid_config() {
+    let server = start_server().await;
+    let client = new_client(&server, Some("fake.jwt"));
+    let err = client
+        .wasm()
+        .upload(WasmUpload::from_bytes("  ", b"x".to_vec()))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, PulseError::InvalidConfig(_)));
+}
+
+#[tokio::test]
+async fn wasm_upload_requires_exactly_one_source() {
+    let server = start_server().await;
+    let client = new_client(&server, Some("fake.jwt"));
+    // Neither path nor data → InvalidConfig (constructed by hand).
+    let upload = WasmUpload {
+        name: "m".into(),
+        ..Default::default()
+    };
+    let err = client.wasm().upload(upload).await.unwrap_err();
+    assert!(matches!(err, PulseError::InvalidConfig(_)));
+
+    // Both path and data → InvalidConfig.
+    let both = WasmUpload {
+        name: "m".into(),
+        path: Some("x".into()),
+        data: Some(b"y".to_vec()),
+        ..Default::default()
+    };
+    let err = client.wasm().upload(both).await.unwrap_err();
+    assert!(matches!(err, PulseError::InvalidConfig(_)));
+}
+
+#[tokio::test]
+async fn wasm_upload_empty_bytes_is_invalid_config() {
+    let server = start_server().await;
+    let client = new_client(&server, Some("fake.jwt"));
+    let err = client
+        .wasm()
+        .upload(WasmUpload::from_bytes("m", Vec::new()))
         .await
         .unwrap_err();
     assert!(matches!(err, PulseError::InvalidConfig(_)));

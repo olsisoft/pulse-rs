@@ -1,6 +1,6 @@
 [package]
 name = "pulse-client"
-version = "2.6.1"
+version = "2.7.4"
 edition = "2021"
 rust-version = "1.82"
 description = "Official Rust client for StreamFlow Pulse — AI Agent Platform"
@@ -42,7 +42,7 @@ tokio-tungstenite = { version = "0.29", default-features = false, features = ["c
 # whose type names `tokio::net::TcpStream`. tokio is already a transitive dep
 # (reqwest + tokio-tungstenite pull it); declaring it directly with only the
 # `net` feature lets us name the type without inflating the feature set.
-tokio = { version = "1", default-features = false, features = ["net"] }
+tokio = { version = "1", default-features = false, features = ["net", "time"] }
 
 [dev-dependencies]
 # `net`/`io-util`/`rt` let the duplex tests spin a real tokio-tungstenite

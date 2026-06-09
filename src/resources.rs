@@ -395,6 +395,174 @@ impl ModelsResource<'_> {
 }
 
 // ---------------------------------------------------------------------------
+// WasmResource — client.wasm()
+// ---------------------------------------------------------------------------
+
+/// `client.wasm()` — B-110 sandboxed WASM module registry.
+///
+/// Upload WebAssembly modules that the streaming `wasm` operator runs over
+/// events, sandboxed in pure-Java Chicory on the engine (no host syscalls,
+/// bounded linear memory). Modules are org-scoped; upload / delete require the
+/// ADMIN role.
+///
+/// # Example
+///
+/// ```no_run
+/// use pulse_client::{PulseClient, WasmUpload};
+///
+/// # async fn run(client: &PulseClient) -> Result<(), pulse_client::PulseError> {
+/// client
+///     .wasm()
+///     .upload(WasmUpload::from_path("pii-redactor", "./redactor.wasm"))
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
+pub struct WasmResource<'c> {
+    pub(crate) client: &'c PulseClient,
+}
+
+/// B-110 — describes a WASM module upload to [`WasmResource::upload`].
+///
+/// Supply the module bytes either by file `path` (read at upload time) or as
+/// raw `data`. Exactly one of the two must be set — [`WasmResource::upload`]
+/// returns a [`PulseError::InvalidConfig`] otherwise.
+#[derive(Debug, Clone, Default)]
+pub struct WasmUpload {
+    /// Module name referenced by `wasm(module = ...)`.
+    pub name: String,
+    /// Filesystem path to the `.wasm` file. Mutually exclusive with `data`.
+    pub path: Option<String>,
+    /// Raw module bytes. Mutually exclusive with `path`.
+    pub data: Option<Vec<u8>>,
+    /// Optional human-readable description stored alongside the module.
+    pub description: Option<String>,
+}
+
+impl WasmUpload {
+    /// Upload from a filesystem path to the `.wasm` file.
+    pub fn from_path(name: impl Into<String>, path: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            path: Some(path.into()),
+            ..Self::default()
+        }
+    }
+
+    /// Upload from raw module bytes.
+    pub fn from_bytes(name: impl Into<String>, data: Vec<u8>) -> Self {
+        Self {
+            name: name.into(),
+            data: Some(data),
+            ..Self::default()
+        }
+    }
+
+    /// Attach a human-readable description.
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+}
+
+impl WasmResource<'_> {
+    /// `POST /api/pulse/wasm-modules` — upload (or replace) a module.
+    ///
+    /// Sent as `multipart/form-data`: a file part named `module` carrying the
+    /// bytes, plus a text part `name` and (when set) `description`. The module
+    /// is validated server-side (must parse, import no host functions, export
+    /// alloc/process/memory) before persisting. Replacing an existing name
+    /// hot-swaps the module with no agent restart.
+    ///
+    /// Returns the persisted module metadata (name, sha256, version, …).
+    ///
+    /// # Errors
+    ///
+    /// - [`PulseError::InvalidConfig`] if `name` is blank, if neither or both
+    ///   of `path`/`data` are set, or if the module bytes are empty.
+    /// - [`PulseError::Transport`] if reading the file at `path` fails.
+    pub async fn upload(&self, upload: WasmUpload) -> Result<Value, PulseError> {
+        if upload.name.trim().is_empty() {
+            return Err(PulseError::InvalidConfig(
+                "module name must be a non-empty string".to_string(),
+            ));
+        }
+        if upload.path.is_some() == upload.data.is_some() {
+            return Err(PulseError::InvalidConfig(
+                "provide exactly one of 'path' or 'data'".to_string(),
+            ));
+        }
+
+        let (blob, filename) = match (&upload.path, upload.data) {
+            (Some(path), None) => {
+                let bytes = std::fs::read(path)
+                    .map_err(|e| PulseError::InvalidConfig(format!("read {path}: {e}")))?;
+                let filename = path
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("module.wasm")
+                    .to_string();
+                (bytes, filename)
+            }
+            (None, Some(data)) => (data, format!("{}.wasm", upload.name)),
+            // Unreachable — guarded by the XOR check above.
+            _ => unreachable!("exactly one of path/data enforced above"),
+        };
+        if blob.is_empty() {
+            return Err(PulseError::InvalidConfig(
+                "module bytes are empty".to_string(),
+            ));
+        }
+        // Client-side pre-flight validation — mirrors the server's
+        // `ChicoryWasmRunner.validateModule`. Rejecting a non-conforming module
+        // locally avoids a cryptic server 400 / runtime trap.
+        validate_wasm_module(&blob)?;
+
+        let module_part = reqwest::multipart::Part::bytes(blob)
+            .file_name(filename)
+            .mime_str("application/wasm")
+            .map_err(PulseError::Transport)?;
+        let mut form = reqwest::multipart::Form::new()
+            .text("name", upload.name)
+            .part("module", module_part);
+        if let Some(description) = upload.description {
+            form = form.text("description", description);
+        }
+
+        self.client
+            .request_multipart("/api/pulse/wasm-modules", form)
+            .await
+    }
+
+    /// `GET /api/pulse/wasm-modules` — modules registered for the caller's org.
+    pub async fn list(&self) -> Result<Vec<Value>, PulseError> {
+        let result = self
+            .client
+            .request(Method::GET, "/api/pulse/wasm-modules", None::<&()>, true)
+            .await?;
+        Ok(unwrap_list(&result, "modules"))
+    }
+
+    /// `GET /api/pulse/wasm-modules/{name}` — metadata for one module.
+    pub async fn get(&self, name: &str) -> Result<Value, PulseError> {
+        let path = format!("/api/pulse/wasm-modules/{}", encode_path(name));
+        self.client
+            .request(Method::GET, &path, None::<&()>, true)
+            .await
+    }
+
+    /// `DELETE /api/pulse/wasm-modules/{name}` — remove a module (ADMIN).
+    pub async fn delete(&self, name: &str) -> Result<(), PulseError> {
+        let path = format!("/api/pulse/wasm-modules/{}", encode_path(name));
+        self.client
+            .request::<()>(Method::DELETE, &path, None, true)
+            .await?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // UsersResource — client.users()
 // ---------------------------------------------------------------------------
 
@@ -445,6 +613,124 @@ fn encode_path(segment: &str) -> String {
         }
     }
     out
+}
+
+/// Reads an unsigned LEB128 integer from `bytes` starting at `*pos`, advancing
+/// `*pos` past the consumed bytes. Returns `None` on overrun (the caller maps
+/// that to a [`PulseError::Validation`] "malformed WASM module").
+fn read_uleb128(bytes: &[u8], pos: &mut usize) -> Option<u64> {
+    let mut result: u64 = 0;
+    let mut shift: u32 = 0;
+    loop {
+        let byte = *bytes.get(*pos)?;
+        *pos += 1;
+        result |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some(result);
+        }
+        shift += 7;
+        // A uleb128 wider than 64 bits is malformed for our purposes.
+        if shift >= 64 {
+            return None;
+        }
+    }
+}
+
+/// Builds a client-side [`PulseError::Validation`] for the WASM upload path so
+/// the caller sees the SDK's validation error (not a cryptic server 400) before
+/// any network call.
+fn wasm_validation_err(message: &str) -> PulseError {
+    PulseError::Validation {
+        path: "/api/pulse/wasm-modules".to_string(),
+        body: Some(json!({ "error": message })),
+    }
+}
+
+/// Client-side pre-upload validation of a WASM module's raw bytes — inspects the
+/// binary (does NOT execute it) and mirrors the server's
+/// `ChicoryWasmRunner.validateModule`.
+///
+/// A conforming sandbox module must: have the WASM magic + version 1 header,
+/// import zero host functions, and export `alloc`, `process`, and `memory`.
+/// Anything else is rejected with [`PulseError::Validation`] so the failure is
+/// surfaced locally instead of as a server 400 / runtime trap.
+pub fn validate_wasm_module(bytes: &[u8]) -> Result<(), PulseError> {
+    if bytes.len() < 8 {
+        return Err(wasm_validation_err("not a WASM module: too short"));
+    }
+    if bytes[0..4] != [0x00, b'a', b's', b'm'] || bytes[4..8] != [0x01, 0x00, 0x00, 0x00] {
+        return Err(wasm_validation_err("not a WASM module (bad magic/version)"));
+    }
+
+    let malformed = || wasm_validation_err("malformed WASM module");
+
+    let mut has_alloc = false;
+    let mut has_process = false;
+    let mut has_memory = false;
+
+    let mut pos = 8usize;
+    while pos < bytes.len() {
+        // Section id (1 byte) + uleb128 payload size.
+        let id = bytes[pos];
+        pos += 1;
+        let size = read_uleb128(bytes, &mut pos).ok_or_else(malformed)? as usize;
+        let payload_start = pos;
+        let payload_end = payload_start.checked_add(size).ok_or_else(malformed)?;
+        if payload_end > bytes.len() {
+            return Err(malformed());
+        }
+
+        match id {
+            // Import section — any host import disqualifies the module.
+            2 => {
+                let mut p = payload_start;
+                let count = read_uleb128(bytes, &mut p).ok_or_else(malformed)?;
+                if count > 0 {
+                    return Err(wasm_validation_err(
+                        "WASM module imports host functions; it must be a pure sandbox \
+                         (build with no WASI/host imports)",
+                    ));
+                }
+            }
+            // Export section — collect exported names.
+            7 => {
+                let mut p = payload_start;
+                let count = read_uleb128(bytes, &mut p).ok_or_else(malformed)?;
+                for _ in 0..count {
+                    let name_len = read_uleb128(bytes, &mut p).ok_or_else(malformed)? as usize;
+                    let name_end = p.checked_add(name_len).ok_or_else(malformed)?;
+                    if name_end > payload_end {
+                        return Err(malformed());
+                    }
+                    let name = &bytes[p..name_end];
+                    p = name_end;
+                    // 1 kind byte + uleb128 index.
+                    if p >= payload_end {
+                        return Err(malformed());
+                    }
+                    p += 1; // kind
+                    read_uleb128(bytes, &mut p).ok_or_else(malformed)?; // index
+                    match name {
+                        b"alloc" => has_alloc = true,
+                        b"process" => has_process = true,
+                        b"memory" => has_memory = true,
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        // Advance past the section payload regardless of id.
+        pos = payload_end;
+    }
+
+    if !(has_alloc && has_process && has_memory) {
+        return Err(wasm_validation_err(
+            "WASM module must export alloc, process and memory",
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
