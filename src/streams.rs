@@ -336,6 +336,18 @@ pub struct MlPredictOptions {
     pub on_failure: Option<String>,
 }
 
+/// B-110 — options for [`StreamBuilder::wasm`]. `module` is required.
+#[derive(Debug, Clone, Default)]
+pub struct WasmOptions {
+    /// Registered module name (upload first via `client.wasm().upload(...)`).
+    pub module: String,
+    pub parallelism: Option<u32>,
+    /// Must be `"PRESERVE_INPUT"` or `"UNORDERED"`.
+    pub ordering: Option<String>,
+    /// Must be `"EMIT_ERROR"`, `"DROP"`, or `"PASS_THROUGH"`.
+    pub on_failure: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // StreamBuilder
 // ---------------------------------------------------------------------------
@@ -777,6 +789,37 @@ impl StreamBuilder {
             ),
         );
         op.insert("outputField".into(), Value::String(options.output_field));
+        if let Some(n) = options.parallelism {
+            op.insert("parallelism".into(), Value::Number(n.into()));
+        }
+        if let Some(o) = options.ordering {
+            op.insert("ordering".into(), Value::String(o));
+        }
+        if let Some(f) = options.on_failure {
+            op.insert("onFailure".into(), Value::String(f));
+        }
+        self.operators.push(op);
+        self
+    }
+
+    /// B-110 — run a sandboxed WASM module over each event. The uploaded module
+    /// (see [`WasmResource::upload`](crate::WasmResource::upload)) receives the
+    /// event payload bytes and returns the new payload (transform / map) or
+    /// drops the event (filter), running in pure-Java Chicory on the engine —
+    /// no host syscalls, bounded linear memory. Any `wasm32` toolchain (Rust,
+    /// TinyGo, AssemblyScript, C) can author a module against the alloc/process
+    /// ABI.
+    pub fn wasm(mut self, options: WasmOptions) -> Self {
+        require_nonblank("module", &options.module);
+        if let Some(ref o) = options.ordering {
+            if o != "PRESERVE_INPUT" && o != "UNORDERED" {
+                panic!("ordering must be PRESERVE_INPUT or UNORDERED, got {o:?}");
+            }
+        }
+        check_failure(&options.on_failure);
+        let mut op = Map::new();
+        op.insert("type".into(), Value::String("wasm".into()));
+        op.insert("module".into(), Value::String(options.module));
         if let Some(n) = options.parallelism {
             op.insert("parallelism".into(), Value::Number(n.into()));
         }
