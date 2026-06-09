@@ -15,7 +15,7 @@ use crate::events::EventsResource;
 use crate::iq::IQResource;
 use crate::resources::{
     AgentsResource, AuthResource, ConnectorsResource, ModelsResource, PipelinesResource,
-    TemplatesResource, UsersResource,
+    TemplatesResource, UsersResource, WasmResource,
 };
 use crate::streams::StreamsResource;
 
@@ -57,6 +57,76 @@ pub(crate) struct Inner {
     pub(crate) base_url: String,
     pub(crate) http: reqwest::Client,
     pub(crate) token: RwLock<Option<String>>,
+    pub(crate) retry: RetryPolicy,
+}
+
+/// Opt-in automatic-retry policy. The default ([`RetryPolicy::default`]) has
+/// `max_retries == 0`, i.e. retries are **off** — the client makes exactly one
+/// attempt per request. Enable with [`PulseClientBuilder::retry`].
+#[derive(Clone, Debug)]
+pub struct RetryPolicy {
+    /// Maximum number of retries after the first attempt. `0` = off (default).
+    pub max_retries: u32,
+    /// Base backoff; the per-attempt ceiling is `backoff * 2^attempt`.
+    pub backoff: Duration,
+    /// Per-attempt backoff cap.
+    pub max_backoff: Duration,
+    /// Retryable 5xx statuses (default `502, 503, 504`).
+    pub on_status: Vec<u16>,
+    /// When `true`, also retries non-idempotent methods (POST/PATCH) on
+    /// 5xx/transport. Default `false` → only GET/HEAD/PUT/DELETE are retried on
+    /// those, so a POST create is never silently duplicated.
+    pub retry_non_idempotent: bool,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: 0, // off
+            backoff: Duration::from_millis(200),
+            max_backoff: Duration::from_secs(10),
+            on_status: vec![502, 503, 504],
+            retry_non_idempotent: false,
+        }
+    }
+}
+
+impl RetryPolicy {
+    /// A policy that retries up to `max_retries` times with otherwise-default
+    /// backoff (200ms base, 10s cap) and the default retryable statuses.
+    pub fn with_max_retries(max_retries: u32) -> Self {
+        Self {
+            max_retries,
+            ..Self::default()
+        }
+    }
+}
+
+fn is_idempotent(method: &Method) -> bool {
+    *method == Method::GET
+        || *method == Method::HEAD
+        || *method == Method::PUT
+        || *method == Method::DELETE
+        || *method == Method::OPTIONS
+}
+
+/// Full-jitter exponential backoff: a uniform delay in `[0, min(max_backoff,
+/// backoff * 2^attempt)]`. Uses sub-second wall-clock nanos as entropy so no
+/// `rand` dependency is added.
+fn backoff_delay(policy: &RetryPolicy, attempt: u32) -> Duration {
+    let base_ms = policy.backoff.as_millis() as u64;
+    let factor = 1u64 << attempt.min(20); // cap the shift to avoid overflow
+    let ceiling_ms = base_ms
+        .saturating_mul(factor)
+        .min(policy.max_backoff.as_millis() as u64);
+    if ceiling_ms == 0 {
+        return Duration::ZERO;
+    }
+    let entropy = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    Duration::from_millis(entropy % (ceiling_ms + 1))
 }
 
 impl PulseClient {
@@ -111,6 +181,12 @@ impl PulseClient {
     /// get / delete ONNX models scored by the streaming `ml_predict` operator).
     pub fn models(&self) -> ModelsResource<'_> {
         ModelsResource { client: self }
+    }
+
+    /// `client.wasm()` — B-110 sandboxed WASM module registry (upload / list /
+    /// get / delete WebAssembly modules run by the streaming `wasm` operator).
+    pub fn wasm(&self) -> WasmResource<'_> {
+        WasmResource { client: self }
     }
 
     /// `client.connectors()` — the connector catalogue (B-093 family + every
@@ -186,7 +262,67 @@ impl PulseClient {
     // ------------------------------------------------------------------
     // Internal: request execution + error translation
     // ------------------------------------------------------------------
+    /// Runs [`request_once`](Self::request_once) under the opt-in retry policy.
+    /// With retries off (the default) this is exactly one attempt.
     pub(crate) async fn request<B: Serialize + ?Sized>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&B>,
+        authenticated: bool,
+    ) -> Result<Value, PulseError> {
+        let mut attempt: u32 = 0;
+        loop {
+            let result = self
+                .request_once(method.clone(), path, body, authenticated)
+                .await;
+            let err = match &result {
+                Ok(_) => return result,
+                Err(e) => e,
+            };
+            if attempt >= self.inner.retry.max_retries {
+                return result;
+            }
+            match self.retry_delay(&method, err, attempt) {
+                Some(delay) => {
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+                None => return result,
+            }
+        }
+    }
+
+    /// Returns `Some(delay)` when `err` is retryable for `method` at this
+    /// attempt, else `None`. 429 → any method (honour Retry-After); `on_status`
+    /// 5xx + transport → idempotent methods only (unless `retry_non_idempotent`).
+    fn retry_delay(&self, method: &Method, err: &PulseError, attempt: u32) -> Option<Duration> {
+        let policy = &self.inner.retry;
+        if let PulseError::RateLimit {
+            retry_after_seconds,
+            ..
+        } = err
+        {
+            // 429: rejected, never processed → safe to retry any method.
+            return Some(
+                retry_after_seconds
+                    .map(|s| Duration::from_secs(s as u64))
+                    .unwrap_or_else(|| backoff_delay(policy, attempt)),
+            );
+        }
+        if !is_idempotent(method) && !policy.retry_non_idempotent {
+            return None;
+        }
+        match err {
+            PulseError::Api { status, .. } if policy.on_status.contains(status) => {
+                Some(backoff_delay(policy, attempt))
+            }
+            PulseError::Transport(_) => Some(backoff_delay(policy, attempt)),
+            _ => None,
+        }
+    }
+
+    async fn request_once<B: Serialize + ?Sized>(
         &self,
         method: Method,
         path: &str,
@@ -376,6 +512,7 @@ pub struct PulseClientBuilder {
     token: Option<String>,
     timeout: Option<Duration>,
     http: Option<reqwest::Client>,
+    retry: Option<RetryPolicy>,
 }
 
 impl PulseClientBuilder {
@@ -404,6 +541,16 @@ impl PulseClientBuilder {
         self
     }
 
+    /// Optional — enable opt-in, bounded, full-jitter exponential-backoff
+    /// retries. Off by default. 429 (rate limited) is always retried for any
+    /// method (honouring Retry-After); `on_status` 5xx and transport errors are
+    /// retried only for idempotent methods unless `retry_non_idempotent` is set.
+    /// Terminal 4xx are never retried.
+    pub fn retry(mut self, policy: RetryPolicy) -> Self {
+        self.retry = Some(policy);
+        self
+    }
+
     pub fn build(self) -> Result<PulseClient, PulseError> {
         let base_url = self
             .base_url
@@ -428,6 +575,7 @@ impl PulseClientBuilder {
                 base_url: strip_trailing_slash(&base_url),
                 http,
                 token: RwLock::new(self.token),
+                retry: self.retry.unwrap_or_default(),
             }),
         })
     }

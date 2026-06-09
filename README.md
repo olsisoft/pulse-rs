@@ -134,6 +134,37 @@ let out = ch.recv().await?;   // out.correlation_id == Some("tx-1")
 ch.close().await?;
 ```
 
+## Sandboxed WASM transforms
+
+Run an uploaded WebAssembly module over each event (B-110), sandboxed in pure-Java
+Chicory on the engine — no host syscalls, bounded linear memory. Any `wasm32`
+toolchain (Rust, TinyGo, AssemblyScript, C) can author a module against the
+alloc/process ABI; upload / delete require the ADMIN role.
+
+```rust
+use pulse_client::{WasmUpload, WasmOptions};
+
+// Upload a module, then run it inline in a stream
+client.wasm().upload(WasmUpload::from_path("pii-redactor", "./redactor.wasm")).await?;
+client.streams().deploy(
+    builder.from_topic("events")
+        .wasm(WasmOptions {
+            module: "pii-redactor".into(),
+            parallelism: Some(4),
+            ordering: None,
+            on_failure: Some("PASS_THROUGH".into()),
+        })
+        .to_topic("clean")
+).await?;
+```
+
+**Legacy formats & protocols — the headline use case.** Compile *any* existing
+parser to `wasm32` and drop it in as a single-message transform to bring legacy
+data into the pipeline — **COBOL copybooks**, FIX, HL7, EDI X12, ASN.1, Modbus, …
+You don't rewrite the parser, you wrap it (see the `pulse-wasm-guest` guest SDK for
+the Rust/TinyGo/AssemblyScript/C operator ABI). Pair it with `ml_predict` (ONNX
+above) to parse *and* score each event in-stream, no external service.
+
 ## Authentication
 
 Three patterns:
@@ -213,6 +244,39 @@ cargo doc --no-deps --open
 ```
 
 CI runs the same on every push touching `pulse-rs/` — see `.github/workflows/pulse-rs.yaml`.
+
+## Automatic retry (opt-in)
+
+Off by default — one attempt per request. Enable bounded, full-jitter
+exponential-backoff retries via `RetryPolicy`:
+
+```rust
+use pulse_client::RetryPolicy;
+
+let client = PulseClient::builder()
+    .base_url("http://localhost:9090")
+    .retry(RetryPolicy::with_max_retries(3))   // or a full RetryPolicy { .. }
+    .build()?;
+```
+
+429 (rate limited) is retried for any method, honouring `Retry-After`;
+`on_status` 5xx (default `502/503/504`) and transport errors are retried only for
+idempotent methods (GET/HEAD/PUT/DELETE) unless `retry_non_idempotent`; terminal
+4xx are never retried.
+
+## Local pipeline simulation (Python-only today)
+
+The streams DSL is **client-side declaration, server-side execution**:
+`streams().compile(&builder)` builds the pipeline JSON locally (no network) and
+`streams().deploy(&builder)` runs it on the Pulse engine. This SDK has **no
+in-process simulator** — to validate a pipeline before deploy, `compile()` and
+inspect the JSON, or deploy to a dev Pulse.
+
+> A local `TopologyTestDriver`-style executor that runs a streams pipeline
+> in-process over sample events (`StreamBuilder::simulate(events)`) currently
+> exists **only in the Python SDK** (`streamflow-pulse-client`). Cross-language
+> parity is tracked as **B-169** (issue #311); until then, local simulation is a
+> Python-exclusive capability.
 
 ## Roadmap
 
