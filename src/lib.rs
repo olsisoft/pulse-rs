@@ -43,7 +43,7 @@
 //! (`streamflow-pulse/src/main/resources/openapi/openapi.yaml`). Drift caught
 //! at PR time by the in-tree spec invariant tests (B-103).
 
-#![doc(html_root_url = "https://docs.rs/pulse-client/2.6.1")]
+#![doc(html_root_url = "https://docs.rs/pulse-client/2.7.5")]
 #![warn(missing_debug_implementations)]
 #![warn(rust_2018_idioms)]
 
@@ -75,7 +75,7 @@ pub use streams::{
 pub use serde_json::Value;
 
 /// Current SDK version (matches `Cargo.toml` and the Pulse server it targets).
-pub const VERSION: &str = "2.6.1";
+pub const VERSION: &str = "2.7.8";
 
 impl std::fmt::Debug for PulseClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

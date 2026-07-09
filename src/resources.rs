@@ -63,7 +63,11 @@ impl AuthResource<'_> {
 }
 
 fn cache_token(client: &PulseClient, response: &Value) {
-    if let Some(token) = response.get("token").and_then(Value::as_str) {
+    if let Some(token) = response
+        .get("accessToken")
+        .or_else(|| response.get("token"))
+        .and_then(Value::as_str)
+    {
         if !token.is_empty() {
             client.set_token(token);
         }
