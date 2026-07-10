@@ -19,7 +19,7 @@ use crate::resources::{
 };
 use crate::streams::StreamsResource;
 
-const USER_AGENT: &str = "pulse-client-rust/2.6.0";
+const USER_AGENT: &str = "pulse-client-rust/2.7.5";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Async HTTP client for the Pulse REST API.
