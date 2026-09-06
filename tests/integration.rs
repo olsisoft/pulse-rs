@@ -104,7 +104,7 @@ async fn login_caches_token() {
         .and(path("/api/auth/login"))
         .and(body_string_contains(r#""alice""#))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "token": "new.jwt.token",
+            "accessToken": "new.jwt.token",
             "refreshToken": "refresh.token",
             "activeOrg": { "id": "org1", "name": "Acme" }
         })))
