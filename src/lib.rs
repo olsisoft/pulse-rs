@@ -43,7 +43,7 @@
 //! (`streamflow-pulse/src/main/resources/openapi/openapi.yaml`). Drift caught
 //! at PR time by the in-tree spec invariant tests (B-103).
 
-#![doc(html_root_url = "https://docs.rs/pulse-client/2.6.1")]
+#![doc(html_root_url = "https://docs.rs/pulse-client/2.7.10")]
 #![warn(missing_debug_implementations)]
 #![warn(rust_2018_idioms)]
 
@@ -61,8 +61,9 @@ pub use error::PulseError;
 pub use events::{EventsResource, EventsStream};
 pub use iq::{iq_and, iq_leaf, iq_not, iq_or, IQQueryOptions, IQResource, IQScanOptions};
 pub use resources::{
-    validate_wasm_module, AgentsResource, AuthResource, ConnectorsResource, ModelUpload,
-    ModelsResource, PipelinesResource, TemplatesResource, UsersResource, WasmResource, WasmUpload,
+    validate_wasm_module, AgentsResource, AuthResource, ConnectorsResource, EvalsResource,
+    ModelUpload, ModelsResource, PipelinesResource, PvscResource, TemplatesResource, UsersResource,
+    WasmResource, WasmUpload,
 };
 pub use streams::{
     aggs, windows, BranchSpec, BroadcastJoinOptions, CdcJoinOptions, CepOptions,
@@ -75,7 +76,7 @@ pub use streams::{
 pub use serde_json::Value;
 
 /// Current SDK version (matches `Cargo.toml` and the Pulse server it targets).
-pub const VERSION: &str = "2.6.1";
+pub const VERSION: &str = "2.7.10";
 
 impl std::fmt::Debug for PulseClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

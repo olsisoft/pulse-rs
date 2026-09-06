@@ -1,13 +1,15 @@
 [package]
 name = "pulse-client"
-version = "2.7.4"
+version = "2.7.10"
 edition = "2021"
 rust-version = "1.82"
 description = "Official Rust client for StreamFlow Pulse — AI Agent Platform"
 license = "Apache-2.0"
 authors = ["Njong Michael <mike.njo@gmail.com>"]
-repository = "https://github.com/olsisoft/pulse-rs"
-homepage = "https://github.com/olsisoft/pulse-rs"
+# Public, verifiable links only (2026-08-13): the repository link pointed at the
+# private monorepo (public 404). Re-add it when the public streamflowmesh org
+# hosts the SDK source.
+homepage = "https://streamflowmesh.io"
 documentation = "https://docs.rs/pulse-client"
 readme = "README.md"
 keywords = ["pulse", "streamflow", "ai", "agents", "pipelines"]
