@@ -15,11 +15,10 @@ use crate::events::EventsResource;
 use crate::iq::IQResource;
 use crate::resources::{
     AgentsResource, AuthResource, ConnectorsResource, ModelsResource, PipelinesResource,
-    TemplatesResource, UsersResource, WasmResource,
-};
+    TemplatesResource, UsersResource, WasmResource, EvalsResource, PvscResource,};
 use crate::streams::StreamsResource;
 
-const USER_AGENT: &str = "pulse-client-rust/2.6.0";
+const USER_AGENT: &str = "pulse-client-rust/2.7.10";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Async HTTP client for the Pulse REST API.
@@ -204,6 +203,16 @@ impl PulseClient {
     }
 
     /// `client.streams()` — B-107 Kafka-Streams-like declarative DSL.
+    /// PVSC — topic contracts, arbitration policy, guardians and the DLQ.
+    pub fn pvsc(&self) -> PvscResource<'_> {
+        PvscResource { client: self }
+    }
+
+    /// Eval suites — golden cases with a ratcheting non-regression gate.
+    pub fn evals(&self) -> EvalsResource<'_> {
+        EvalsResource { client: self }
+    }
+
     pub fn streams(&self) -> StreamsResource<'_> {
         StreamsResource { client: self }
     }
