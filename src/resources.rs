@@ -63,7 +63,11 @@ impl AuthResource<'_> {
 }
 
 fn cache_token(client: &PulseClient, response: &Value) {
-    if let Some(token) = response.get("token").and_then(Value::as_str) {
+    if let Some(token) = response
+        .get("accessToken")
+        .or_else(|| response.get("token"))
+        .and_then(Value::as_str)
+    {
         if !token.is_empty() {
             client.set_token(token);
         }
@@ -591,6 +595,205 @@ impl UsersResource<'_> {
 /// Extracts a `Vec<Value>` from `result[key]`. Returns an empty Vec for
 /// missing / malformed envelopes — never panics — so callers can iterate
 /// safely.
+// ---------------------------------------------------------------------------
+// PvscResource — client.pvsc()
+// ---------------------------------------------------------------------------
+
+/// Topic contracts, arbitration policy, guardians and the firewall DLQ.
+#[derive(Debug)]
+pub struct PvscResource<'c> {
+    pub(crate) client: &'c PulseClient,
+}
+
+impl PvscResource<'_> {
+    /// `GET /api/pulse/pvsc/schemas` — every registered topic contract.
+    pub async fn schemas(&self) -> Result<Vec<Value>, PulseError> {
+        let result = self
+            .client
+            .request(Method::GET, "/api/pulse/pvsc/schemas", None::<&()>, true)
+            .await?;
+        Ok(unwrap_list(&result, "schemas"))
+    }
+
+    /// `PUT /api/pulse/pvsc/schemas` — registers or replaces a topic's contract.
+    ///
+    /// A field rule may carry `grounding`: `"required"` blocks a value the
+    /// agent could not have derived from what it was given, `"warn"` reports
+    /// it, and the default `"ignore"` does not look. That is the check that
+    /// catches a figure which is well-typed, in range, confidently asserted
+    /// and invented — every other rule in the schema passes such a value.
+    ///
+    /// A field rule may also carry `derivation`: `"deny"` (the default — the
+    /// figure must appear in the input) or `"allow"` (the agent may compute it
+    /// in one step). Arithmetic provenance is opt-in because "derivable" is not
+    /// "derived": with an input of 42, the value 84 is reachable as 42 + 42
+    /// without anything having performed that addition.
+    ///
+    /// The write REPLACES the schema rather than merging into it: a field you
+    /// omit is gone, grounding policy included.
+    pub async fn save_schema(&self, schema: &Value) -> Result<Value, PulseError> {
+        self.client
+            .request(Method::PUT, "/api/pulse/pvsc/schemas", Some(schema), true)
+            .await
+    }
+
+    /// `DELETE /api/pulse/pvsc/schemas` — drops a topic's contract.
+    pub async fn delete_schema(&self, topic: &str) -> Result<Value, PulseError> {
+        let body = json!({ "topic": topic });
+        self.client
+            .request(Method::DELETE, "/api/pulse/pvsc/schemas", Some(&body), true)
+            .await
+    }
+
+    /// `GET /api/pulse/pvsc/config` — consensus, degradation and arbitration.
+    pub async fn config(&self) -> Result<Value, PulseError> {
+        self.client
+            .request(Method::GET, "/api/pulse/pvsc/config", None::<&()>, true)
+            .await
+    }
+
+    /// `PUT /api/pulse/pvsc/config` — patches the settings named in `patch`.
+    pub async fn update_config(&self, patch: &Value) -> Result<Value, PulseError> {
+        self.client
+            .request(Method::PUT, "/api/pulse/pvsc/config", Some(patch), true)
+            .await
+    }
+
+    /// Replaces the arbitration stances.
+    ///
+    /// A stance is attached to the guardian that votes, never read out of what
+    /// the vote says. Lower `precedence` wins — rank 1 outranks rank 2 — and a
+    /// `veto` stance blocks by construction rather than by count. An empty
+    /// list disables arbitration, so the majority result stands.
+    pub async fn set_stances(&self, stances: &[Value]) -> Result<Value, PulseError> {
+        let body = json!({ "arbitrationStances": stances });
+        self.update_config(&body).await
+    }
+
+    /// `GET /api/pulse/pvsc/metrics` — counters plus the quorum information
+    /// yield (`quorumInformationYield`, `quorumRedundantGuardianCalls`,
+    /// `quorumInterpretation`), which say whether consulting the quorum
+    /// changed any decision the first guardian would have made alone.
+    pub async fn metrics(&self) -> Result<Value, PulseError> {
+        self.client
+            .request(Method::GET, "/api/pulse/pvsc/metrics", None::<&()>, true)
+            .await
+    }
+
+    /// `GET /api/pulse/pvsc/guardians` — the registered guardian pool.
+    pub async fn guardians(&self) -> Result<Vec<Value>, PulseError> {
+        let result = self
+            .client
+            .request(Method::GET, "/api/pulse/pvsc/guardians", None::<&()>, true)
+            .await?;
+        Ok(unwrap_list(&result, "guardians"))
+    }
+
+    /// `GET /api/pulse/pvsc/dlq` — events the firewall turned away.
+    pub async fn dlq(&self) -> Result<Vec<Value>, PulseError> {
+        let result = self
+            .client
+            .request(Method::GET, "/api/pulse/pvsc/dlq", None::<&()>, true)
+            .await?;
+        Ok(unwrap_list(&result, "entries"))
+    }
+
+    /// `POST /api/pulse/pvsc/dlq/reinject` — replays one blocked event.
+    pub async fn reinject(&self, event_id: &str) -> Result<Value, PulseError> {
+        let body = json!({ "eventId": event_id });
+        self.client
+            .request(
+                Method::POST,
+                "/api/pulse/pvsc/dlq/reinject",
+                Some(&body),
+                true,
+            )
+            .await
+    }
+
+    /// `POST /api/pulse/pvsc/dlq/discard` — drops one blocked event for good.
+    pub async fn discard(&self, event_id: &str) -> Result<Value, PulseError> {
+        let body = json!({ "eventId": event_id });
+        self.client
+            .request(
+                Method::POST,
+                "/api/pulse/pvsc/dlq/discard",
+                Some(&body),
+                true,
+            )
+            .await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EvalsResource — client.evals()
+// ---------------------------------------------------------------------------
+
+/// Golden cases replayed against live agents.
+///
+/// The gate counts PASSES against a recorded floor rather than counting
+/// failures, so deleting an assertion cannot satisfy it. Cases run
+/// node-isolated: nothing is persisted, published to a downstream topic, or
+/// acted on, which is what makes running a suite against production agents
+/// safe.
+#[derive(Debug)]
+pub struct EvalsResource<'c> {
+    pub(crate) client: &'c PulseClient,
+}
+
+impl EvalsResource<'_> {
+    /// `GET /api/pulse/evals` — the suite ids that have at least one case.
+    pub async fn suites(&self) -> Result<Vec<String>, PulseError> {
+        let result = self
+            .client
+            .request(Method::GET, "/api/pulse/evals", None::<&()>, true)
+            .await?;
+        Ok(unwrap_list(&result, "suites")
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect())
+    }
+
+    /// `GET /api/pulse/evals/cases?suite=` — the cases in one suite.
+    pub async fn cases(&self, suite_id: &str) -> Result<Vec<Value>, PulseError> {
+        let path = format!("/api/pulse/evals/cases?suite={}", encode_path(suite_id));
+        let result = self
+            .client
+            .request(Method::GET, &path, None::<&()>, true)
+            .await?;
+        Ok(unwrap_list(&result, "cases"))
+    }
+
+    /// `POST /api/pulse/evals/cases` — adds or replaces one case.
+    pub async fn save_case(&self, case: &Value) -> Result<Value, PulseError> {
+        self.client
+            .request(Method::POST, "/api/pulse/evals/cases", Some(case), true)
+            .await
+    }
+
+    /// `POST /api/pulse/evals/run` — replays every case in the suite.
+    ///
+    /// A REGRESSION comes back as a normal response with `blocksRelease: true`,
+    /// not as an error: the run succeeded and the gate's verdict is data.
+    /// Branch on `blocksRelease`, not on whether this returned `Err`.
+    pub async fn run(&self, suite_id: &str) -> Result<Value, PulseError> {
+        let body = json!({ "suiteId": suite_id });
+        self.client
+            .request(Method::POST, "/api/pulse/evals/run", Some(&body), true)
+            .await
+    }
+
+    /// `POST /api/pulse/evals/baseline` — records the current passing count as
+    /// the floor future runs are held to. Call it after a run you are happy
+    /// with; calling it after a bad one ratchets the floor DOWN.
+    pub async fn record_baseline(&self, suite_id: &str) -> Result<Value, PulseError> {
+        let body = json!({ "suiteId": suite_id });
+        self.client
+            .request(Method::POST, "/api/pulse/evals/baseline", Some(&body), true)
+            .await
+    }
+}
+
 fn unwrap_list(result: &Value, key: &str) -> Vec<Value> {
     result
         .get(key)
