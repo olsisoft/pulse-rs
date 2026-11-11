@@ -1,6 +1,6 @@
 # pulse-client — Rust SDK for StreamFlow Pulse
 
-Official Rust client for [Pulse](https://github.com/olsisoft/pulse-rs) — the AI Agent Platform. Async-first, **`reqwest` + `serde`** stack, **MSRV 1.82**.
+Official Rust client for [Pulse](https://github.com/olsisoft/pulse) — the AI Agent Platform. Async-first, **`reqwest` + `serde`** stack, **MSRV 1.82**.
 
 ```rust
 use pulse_client::PulseClient;
@@ -37,7 +37,7 @@ Requires **Rust 1.82+** as a best-effort MSRV (declared in `Cargo.toml`). CI tes
 - **`rustls` by default** — no system OpenSSL dance. Cross-compile works out of the box.
 - **Sibling parity** — same surface + naming as the Python (`pulse-py`), JavaScript (`@olsisoft/pulse-client`), Java (`com.streamflow:pulse-client`), and Go (`github.com/olsisoft/pulse-go`) SDKs.
 - **Cheap to clone** — `PulseClient: Clone`, the underlying `reqwest::Client` pools connections, the token sits behind `Arc<RwLock>`. Share a single instance across tasks.
-- **Spec-aligned** — every method corresponds 1:1 to an endpoint in the [Pulse OpenAPI 3.1 spec](../streamflow-pulse/src/main/resources/openapi/openapi.yaml). Drift caught at PR time by the in-tree spec invariant tests (B-103).
+- **Spec-aligned** — every method corresponds 1:1 to an endpoint in the [Pulse OpenAPI 3.1 spec](https://github.com/olsisoft/pulse/blob/main/streamflow-pulse/src/main/resources/openapi/openapi.yaml). Drift caught at PR time by the in-tree spec invariant tests (B-103).
 
 ## Quick start
 
@@ -109,7 +109,7 @@ Full ~112-endpoint surface documented in Swagger UI at `<pulse-server>/api-docs`
 
 Score events with an uploaded ONNX model in-process (B-112), and open a
 bidirectional duplex channel for synchronous decisions (B-114). Full guide:
-[ML inference & duplex](https://github.com/olsisoft/pulse-rs/blob/dev/docs/SDK-ML-INFERENCE-AND-DUPLEX.md).
+[ML inference & duplex](https://github.com/olsisoft/pulse/blob/main/streamflow-pulse/src/main/resources/developer-hub/sdk-reference.md).
 
 ```rust
 use pulse_client::{ModelUpload, MlPredictOptions};
@@ -308,10 +308,18 @@ inspect the JSON, or deploy to a dev Pulse.
 - **v2.5.x** — current async API, 5 core resources, `version()`.
 - **v2.6.x** — expanded resource coverage: backups, schedules, credentials, settings, approvals, chat.
 - **v3.0** — schema-bound DTOs (typed structs instead of `serde_json::Value`); event-stream consumer as a `Stream<Item = Event>` consuming `/api/pulse/events/stream` (SSE).
-- **B-098 satellite** — once `olsisoft/pulse-rs` exists, this in-tree code lifts out and publishes to crates.io. `cargo add pulse-client` will switch to the satellite; in-tree continues to mirror for one release cycle.
+- **Historical B-098 satellite (LEGACY_COMPATIBILITY)** — once `olsisoft/pulse-rs` exists, this in-tree code lifts out and publishes to crates.io. `cargo add pulse-client` will switch to the satellite; in-tree continues to mirror for one release cycle.
 
 Track progress in [`docs/STREAMFLOW-BACKLOG.md`](../docs/STREAMFLOW-BACKLOG.md) under item **B-098**.
 
 ## License
 
 Apache 2.0 — same as the parent Pulse repository.
+
+## Canonical source and local qualification
+
+Canonical implementation: [olsisoft/pulse](https://github.com/olsisoft/pulse),
+not historical StreamFlow source. Existing public package identities, release
+URLs and protocol endpoints remain unchanged. Published installations/channels are
+LEGACY_COMPATIBILITY; PE1 qualifies only explicit local/private candidate artifacts.
+See [CONTRIBUTING.md](CONTRIBUTING.md).
